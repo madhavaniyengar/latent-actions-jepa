@@ -32,7 +32,7 @@ class PredictorMultiMaskWrapper(nn.Module):
         super().__init__()
         self.backbone = backbone
 
-    def forward(self, ctxt, tgt, masks_ctxt, masks_tgt, action_cls_tokens):
+    def forward(self, ctxt, tgt, masks_ctxt, masks_tgt):
         if type(ctxt) is not list:
             ctxt = [ctxt]
         if type(tgt) is not list:
@@ -43,6 +43,6 @@ class PredictorMultiMaskWrapper(nn.Module):
             masks_tgt = [masks_tgt]
 
         outs = []
-        for i, (zi, hi, mc, mt, at) in enumerate(zip(ctxt, tgt, masks_ctxt, masks_tgt, action_cls_tokens)):
-            outs += [self.backbone(zi, hi, mc, mt, at, mask_index=i)]
+        for i, (zi, hi, mc, mt) in enumerate(zip(ctxt, tgt, masks_ctxt, masks_tgt)):
+            outs += [self.backbone(zi, hi, mc, mt, mask_index=i)]
         return outs

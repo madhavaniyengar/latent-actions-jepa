@@ -1,2 +1,9 @@
 .*.swp
 *.pyc
+droid_videos/
+droid_videos_full
+logging/
+*/__pycache__/
+ckpts/
+.vscode/
+dist/

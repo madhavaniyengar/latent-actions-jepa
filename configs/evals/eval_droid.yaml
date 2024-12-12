@@ -1,0 +1,32 @@
+pretrain:
+  checkpoint_key: "target_encoder"  # Key for loading the model from checkpoint
+  model_name: "vit_large"  # Name of the model architecture
+  patch_size: 16  # Patch size used in the model
+  folder: "/home/madhavan/jepa/logging/"  # Folder containing the pre-trained model checkpoint
+  # checkpoint: "/home/madhavan/jepa/logging/jepa_actions_freeze_none-latest.pth.tar"  # Filename of the pre-trained checkpoint
+  checkpoint: '/home/madhavan/jepa/logging/finetune_libero-latest.pth.tar'
+  write_tag: "tsne_visualization"  # Tag used for logging and saving outputs
+  use_sdpa: true  # Whether to use scaled dot-product attention
+  use_silu: false  # Whether to use SiLU activation function
+  tight_silu: true  # Whether to use tight SiLU
+  uniform_power: false  # Uniform power initialization
+  tubelet_size: 2  # Tubelet size for video input
+  frames_per_clip: 16  # Number of frames per video clip during pre-training
+  delta_frames: 4  # Delta frames for action token grouping
+  action_dim: 1024  # Dimension of the action tokens (should match model's embed_dim)
+  frame_step: 4  # Frame sampling rate
+
+data:
+  dataset_val: "/home/madhavan/jepa/droid_videos/video_labels.csv"  # Path to the validation dataset
+  dataset_type: "VideoDataset"  # Type of dataset
+  num_classes: 10  # Number of classes in the dataset
+  num_segments: 1  # Number of temporal segments per video
+  frames_per_clip: 16  # Number of frames per video clip
+  num_views_per_segment: 1  # Number of spatial views per segment
+
+optimization:
+  resolution: 224  # Input resolution
+  batch_size: 1  # Batch size for data loading
+  use_bfloat16: false  # Whether to use bfloat16 precision
+
+tag: "freeze_none"  # Experiment tag for logging

@@ -30,6 +30,7 @@ from torch.nn.parallel import DistributedDataParallel
 from src.datasets.data_manager import init_data
 from src.masks.random_tube import MaskCollator as TubeMaskCollator
 from src.masks.multiblock3d import MaskCollator as MB3DMaskCollator
+from src.masks.random_p import MaskCollator as RandomPMaskCollator
 from src.masks.utils import apply_masks
 from src.utils.distributed import init_distributed, AllReduce
 from src.utils.logging import (
@@ -207,7 +208,7 @@ def main(args, resume_preempt=False):
     )
 
     # -- init model
-    encoder, predictor, action_mlp = init_video_model(
+    encoder, predictor, action_model = init_video_model(
         uniform_power=uniform_power,
         use_mask_tokens=use_mask_tokens,
         num_mask_tokens=len(cfgs_mask),
@@ -223,7 +224,8 @@ def main(args, resume_preempt=False):
         action_dim=action_dim,
         use_sdpa=use_sdpa,
         delta_frames=delta_frames,
-        clip_embed_dim=512
+        clip_embed_dim=512,
+        action_transformer=True,
     )
     target_encoder = copy.deepcopy(encoder)
 
@@ -231,6 +233,14 @@ def main(args, resume_preempt=False):
     if mask_type == 'multiblock3d':
         logger.info('Initializing basic multi-block mask')
         mask_collator = MB3DMaskCollator(
+            crop_size=crop_size,
+            num_frames=num_frames,
+            patch_size=patch_size,
+            tubelet_size=tubelet_size,
+            cfgs_mask=cfgs_mask)
+    elif mask_type == 'random_p':
+        logger.info('Initializing random p multi-block mask')
+        mask_collator = RandomPMaskCollator(
             crop_size=crop_size,
             num_frames=num_frames,
             patch_size=patch_size,
@@ -286,7 +296,7 @@ def main(args, resume_preempt=False):
     optimizer, scaler, scheduler, wd_scheduler = init_opt(
         encoder=encoder,
         predictor=predictor,
-        action_mlp=action_mlp,
+        action_model=action_model,
         wd=wd,
         final_wd=final_wd,
         start_lr=start_lr,
@@ -301,7 +311,7 @@ def main(args, resume_preempt=False):
         eps=eps)
     encoder = DistributedDataParallel(encoder, static_graph=True)
     predictor = DistributedDataParallel(predictor, static_graph=True)
-    action_mlp = DistributedDataParallel(action_mlp, static_graph=True)
+    action_model = DistributedDataParallel(action_model, static_graph=True)
     target_encoder = DistributedDataParallel(target_encoder)
     for p in target_encoder.parameters():
         p.requires_grad = False
@@ -309,7 +319,7 @@ def main(args, resume_preempt=False):
         p.requires_grad = True
     for p in predictor.parameters():
         p.requires_grad = True
-    for p in action_mlp.parameters():
+    for p in action_model.parameters():
         p.requires_grad = True
         
         
@@ -350,7 +360,7 @@ def main(args, resume_preempt=False):
         save_dict = {
             'encoder': encoder.state_dict(),
             'predictor': predictor.state_dict(),
-            'action_mlp': action_mlp.state_dict(),
+            'action_model': action_model.state_dict(),
             'opt': optimizer.state_dict(),
             'scaler': None if scaler is None else scaler.state_dict(),
             'target_encoder': target_encoder.state_dict(),
@@ -400,11 +410,11 @@ def main(args, resume_preempt=False):
             itr_start_time = time.time()
 
             try:
-                udata, masks_enc, masks_pred = next(loader)
+                udata, masks_enc, masks_pred, p = next(loader)
             except Exception:
                 logger.info('Exhausted data loaders. Refreshing...')
                 loader = iter(unsupervised_loader)
-                udata, masks_enc, masks_pred = next(loader)
+                udata, masks_enc, masks_pred, p = next(loader)
             assert len(masks_enc) == len(masks_pred), \
                 'Currently require num encoder masks = num predictor masks'
 
@@ -447,43 +457,33 @@ def main(args, resume_preempt=False):
                 _new_wd = wd_scheduler.step()
                 # --
 
-                def forward_target(c, text_embeddings):
+                def forward_target(c):
                     """
-                    Returns list of tensors of shape [B, N, D], one for each mask-pred.
+                    Returns list of tensors of shape [B, N, D], one for each
+                    mask-pred.
                     """
                     with torch.no_grad():
                         h = target_encoder(c)
-                        h = F.layer_norm(h, (h.size(-1),))  # [B, N, D]
-
-                        # Compute tokens per frame and delta tokens
-                        B, N, D = h.size()
-                        tokens_per_frame = N // num_frames
-                        delta_tokens = tokens_per_frame * delta_frames
-                        num_groups = N // delta_tokens
-
-                        # Reshape and average pool over delta_tokens
-                        h_grouped = h.view(B, num_groups, delta_tokens, D)
-                        h_pooled = h_grouped.mean(dim=2)  # [B, num_groups, D]
-                        
-                        # append text embeddings to h_pooled
-                        text_embeddings = text_embeddings.repeat(1, 1, 2)
-                        h_pooled = torch.cat([h_pooled, text_embeddings], dim=1) # [B, num_groups+1, D]
-
-                    # Pass through action_mlp to get Action CLS tokens
-                    action_cls_tokens = action_mlp(h_pooled)  # [B, num_groups+1, D]
-
-                    # Apply masks to h
-                    h = apply_masks(h, masks_pred, concat=False)
-
-                    return h, action_cls_tokens
+                        h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim  [B, N, D]
+                        # -- create targets (masked regions of h)
+                        h = apply_masks(h, masks_pred, concat=False)
+                        return h
 
 
-                def forward_context(c, action_cls_tokens):
+                def forward_context(c, text_embeddings, p):
                     """
                     Returns list of tensors of shape [B, N, D], one for each mask-pred.
                     """
                     z = encoder(c, masks_enc)  # [B, N_z, D]
-                    action_cls_tokens = [action_cls_tokens for _ in range(len(masks_pred))]
+                    
+                    # pool each patch by the frame it corresponds to 
+                    per_frame_embeddings = [seq.reshape(seq.size(0), pi, seq.size(1) // pi, seq.size(-1)) for seq, pi in zip(z, p)]
+                    per_frame_embeddings = [pfe.mean(dim=2) for pfe in per_frame_embeddings]  # [B, num_frames, D]
+                    # concat text embeddings with per_frame_embeddings
+                    action_model_input = [torch.cat([text_embeddings.repeat(1, 1, 2), pfe], dim=1) for pfe in per_frame_embeddings]
+                    
+                    # positionally embed the per_frame_embeddings
+                    action_cls_tokens = [action_model(ami) for ami in action_model_input]
                     
                     z = predictor(z, h, masks_enc, masks_pred, action_cls_tokens)
                     return z
@@ -502,8 +502,8 @@ def main(args, resume_preempt=False):
                 # Step 1. Forward
                 loss_jepa, loss_reg = 0., 0.
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                    h, action_cls_tokens = forward_target(clips, text_embeddings)
-                    z = forward_context(clips, action_cls_tokens)
+                    h = forward_target(clips)
+                    z = forward_context(clips, text_embeddings, p)
                     loss_jepa = loss_fn(z, h)  # jepa prediction loss
                     pstd_z = reg_fn(z)  # predictor variance across patches
                     loss_reg += torch.mean(F.relu(1.-pstd_z))

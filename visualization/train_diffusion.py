@@ -1,61 +1,39 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-#
-
+import numpy as np
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.utils.data.distributed import DistributedSampler
+import tensorflow as tf
+import wandb
 import os
-
-# -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
-try:
-    # -- WARNING: IF DOING DISTRIBUTED TRAINING ON A NON-SLURM CLUSTER, MAKE
-    # --          SURE TO UPDATE THIS TO GET LOCAL-RANK ON NODE, OR ENSURE
-    # --          THAT YOUR JOBS ARE LAUNCHED WITH ONLY 1 DEVICE VISIBLE
-    # --          TO EACH PROCESS
-    os.environ['CUDA_VISIBLE_DEVICES'] = os.environ['SLURM_LOCALID']
-except Exception:
-    pass
-
+import yaml
+from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler, DDIMScheduler, StableDiffusionPipeline
+import torch
+from xformers.ops import MemoryEfficientAttentionFlashAttentionOp
+from torch.optim.lr_scheduler import LambdaLR
 import logging
 import pprint
 
-import numpy as np
-
-import torch
-import torch.multiprocessing as mp
-import torch.nn.functional as F
-
-from torch.nn.parallel import DistributedDataParallel
-
+# Import V-JEPA model and necessary utilities
 import src.models.vision_transformer as vit
-from src.models.attentive_pooler import AttentiveClassifier
-from src.datasets.data_manager import (
-    init_data,
-)
-from src.utils.distributed import (
-    init_distributed,
-    AllReduce
-)
-from src.utils.schedulers import (
-    WarmupCosineSchedule,
-    CosineWDSchedule,
-)
-from src.utils.logging import (
-    AverageMeter,
-    CSVLogger
-)
+from src.datasets.data_manager import init_data
+from src.utils.distributed import init_distributed, AllReduce
+from src.utils.schedulers import WarmupCosineSchedule, CosineWDSchedule
+from src.utils.logging import AverageMeter, CSVLogger
+from src.masks.utils import apply_masks
 
-from evals.video_classification_frozen.utils import (
-    make_transforms,
-    ClipAggregation,
-    FrameAggregation
-)
+from visualization.diffusion import StableDiffusion
 
+# Set up logging
 logging.basicConfig()
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+# Global seed for reproducibility
 _GLOBAL_SEED = 0
 np.random.seed(_GLOBAL_SEED)
 torch.manual_seed(_GLOBAL_SEED)
@@ -63,6 +41,125 @@ torch.backends.cudnn.benchmark = True
 
 pp = pprint.PrettyPrinter(indent=4)
 
+class StableDiffusion(torch.nn.Module):
+    def __init__(self, model_id="stabilityai/stable-diffusion-2-1", device="cuda", freeze_unet=False):
+        super().__init__()
+        self.device = device
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        pipeline = StableDiffusionPipeline.from_pretrained(model_id)
+        pipeline = pipeline.to(self.device)
+        
+        self.unet = pipeline.unet
+        self.vae = pipeline.vae
+        self.text_encoder = pipeline.text_encoder
+        self.tokenizer = pipeline.tokenizer
+        self.scheduler = pipeline.scheduler
+        self.image_processor = pipeline.feature_extractor
+        
+        self.encode_empty_text()
+        self.empty_text_embed = self.empty_text_embed.detach().clone().to(device)
+        
+        self.unet.requires_grad_(True)
+        
+        self.vae.requires_grad_(False)
+        self.text_encoder.requires_grad_(False)
+        
+        self.unet.enable_xformers_memory_efficient_attention(attention_op=MemoryEfficientAttentionFlashAttentionOp)
+        self.unet.set_attention_slice("auto")
+
+    def encode_empty_text(self):
+        # encoding empty text
+        text_input = self.tokenizer(
+            "",
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        self.empty_text_embed = self.text_encoder(text_input.input_ids.to(self.device))[0]
+
+    def encode_image(self, image):
+        if isinstance(image, np.ndarray):
+            image = torch.from_numpy(image).to(self.device)
+        elif isinstance(image, list):
+            image = torch.stack([torch.from_numpy(np.array(self.image_processor(img)['pixel_values'])).squeeze(0) for img in image]).to(self.device)
+        else:
+            image = image.to(self.device)
+        latents = self.vae.encode(image).latent_dist.sample() * 0.18215 # get the latent sample from VAE
+        return latents
+
+    def decode_latents(self, latents):
+        latents = latents / 0.18215
+        image = self.vae.decode(latents).sample
+        image = (image / 2 + 0.5).clamp(0, 1)
+        return image
+
+    def forward(self, I0, masked_embedding=None):
+        batch_size = I0.shape[0]
+
+        # move images to latent space
+        I0_latent = self.encode_image(I0)
+        
+        # get random timesteps for entire batch
+        timesteps = torch.randint(
+            0, self.scheduler.config.num_train_timesteps, (batch_size,), device=self.device
+        ).long()
+        
+        # gaussian noise
+        noise = torch.randn_like(I0_latent)
+        noisy_latents = self.scheduler.add_noise(I0_latent, noise, timesteps)
+
+        # Prepare encoder_hidden_states
+        if masked_embedding is not None:
+            sequence_length = self.empty_text_embed.shape[1]
+            masked_embedding = masked_embedding.unsqueeze(1).repeat(1, sequence_length, 1)
+            encoder_hidden_states = masked_embedding
+        else:
+            encoder_hidden_states = self.empty_text_embed
+
+        # predict noise with unet
+        noise_pred = self.unet(
+            noisy_latents, 
+            timesteps, 
+            encoder_hidden_states=encoder_hidden_states
+        ).sample
+
+        # return noise prediction and actual noise added
+        return noise_pred, noise
+    
+    def generate(self, I0, masked_embedding=None, num_inference_steps=50):
+        device = self.device
+
+        with torch.no_grad():
+            I0_latent = self.encode_image(I0)
+
+            noisy_latents = torch.randn_like(I0_latent).to(device)
+
+            self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+            timesteps = self.scheduler.timesteps
+            
+            iterable = tqdm(
+                enumerate(timesteps),
+                total=len(timesteps),
+                leave=False,
+                desc=" " * 4 + "Diffusion denoising",
+            )
+            
+            for i, t in iterable:
+                if masked_embedding is not None:
+                    sequence_length = self.empty_text_embed.shape[1]
+                    masked_embedding = masked_embedding.unsqueeze(1).repeat(1, sequence_length, 1)
+                    encoder_hidden_states = masked_embedding
+                else:
+                    encoder_hidden_states = self.empty_text_embed
+
+                noise_pred = self.unet(noisy_latents, t, encoder_hidden_states=encoder_hidden_states).sample
+                noisy_latents = self.scheduler.step(noise_pred, t, noisy_latents).prev_sample
+
+        denoised_latents = self.decode_latents(noisy_latents)
+
+        return denoised_latents
 
 def main(args_eval, resume_preempt=False):
 
@@ -95,8 +192,8 @@ def main(args_eval, resume_preempt=False):
     num_classes = args_data.get('num_classes')
     eval_num_segments = args_data.get('num_segments', 1)
     eval_frames_per_clip = args_data.get('frames_per_clip', 16)
-    eval_frame_step = args_pretrain.get('frame_step', 4)
-    eval_duration = args_pretrain.get('clip_duration', None)
+    eval_frame_step = args_data.get('frame_step', 4)
+    eval_duration = args_data.get('clip_duration', None)
     eval_num_views_per_segment = args_data.get('num_views_per_segment', 1)
 
     # -- OPTIMIZATION
@@ -145,12 +242,9 @@ def main(args_eval, resume_preempt=False):
     if rank == 0:
         csv_logger = CSVLogger(log_file,
                                ('%d', 'epoch'),
-                               ('%.5f', 'loss'),
-                               ('%.5f', 'acc'))
+                               ('%.5f', 'loss'))
 
-    # Initialize model
-
-    # -- pretrained encoder (frozen)
+    # Initialize encoder (frozen)
     encoder = init_model(
         crop_size=resolution,
         device=device,
@@ -164,27 +258,13 @@ def main(args_eval, resume_preempt=False):
         use_SiLU=use_SiLU,
         tight_SiLU=tight_SiLU,
         use_sdpa=use_sdpa)
-    if pretrain_frames_per_clip == 1:
-        # Process each frame independently and aggregate
-        encoder = FrameAggregation(encoder).to(device)
-    else:
-        # Process each video clip independently and aggregate
-        encoder = ClipAggregation(
-            encoder,
-            tubelet_size=tubelet_size,
-            attend_across_segments=attend_across_segments
-        ).to(device)
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad = False
 
-    # -- init classifier
-    classifier = AttentiveClassifier(
-        embed_dim=encoder.embed_dim,
-        num_heads=encoder.num_heads,
-        depth=1,
-        num_classes=num_classes,
-    ).to(device)
+    # Initialize diffusion model
+    diffusion_model = StableDiffusion(device=device)
+    diffusion_model.to(device)
 
     train_loader = make_dataloader(
         dataset_type=dataset_type,
@@ -193,7 +273,7 @@ def main(args_eval, resume_preempt=False):
         frames_per_clip=eval_frames_per_clip,
         frame_step=eval_frame_step,
         eval_duration=eval_duration,
-        num_segments=eval_num_segments if attend_across_segments else 1,
+        num_segments=eval_num_segments,
         num_views_per_segment=1,
         allow_segment_overlap=True,
         batch_size=batch_size,
@@ -217,9 +297,9 @@ def main(args_eval, resume_preempt=False):
     ipe = len(train_loader)
     logger.info(f'Dataloader created... iterations per epoch: {ipe}')
 
-    # -- optimizer and scheduler
+    # -- optimizer and scheduler for diffusion model
     optimizer, scaler, scheduler, wd_scheduler = init_opt(
-        classifier=classifier,
+        model=diffusion_model,
         wd=wd,
         start_lr=start_lr,
         ref_lr=lr,
@@ -228,24 +308,24 @@ def main(args_eval, resume_preempt=False):
         warmup=warmup,
         num_epochs=num_epochs,
         use_bfloat16=use_bfloat16)
-    classifier = DistributedDataParallel(classifier, static_graph=True)
+    diffusion_model = DistributedDataParallel(diffusion_model, static_graph=True)
 
     # -- load training checkpoint
     start_epoch = 0
     if resume_checkpoint:
-        classifier, optimizer, scaler, start_epoch = load_checkpoint(
+        diffusion_model, optimizer, scaler, start_epoch = load_checkpoint(
             device=device,
             r_path=latest_path,
-            classifier=classifier,
+            model=diffusion_model,
             opt=optimizer,
             scaler=scaler)
         for _ in range(start_epoch*ipe):
             scheduler.step()
             wd_scheduler.step()
-
+            
     def save_checkpoint(epoch):
         save_dict = {
-            'classifier': classifier.state_dict(),
+            'diffusion_model': diffusion_model.state_dict(),
             'opt': optimizer.state_dict(),
             'scaler': None if scaler is None else scaler.state_dict(),
             'epoch': epoch,
@@ -259,61 +339,50 @@ def main(args_eval, resume_preempt=False):
     # TRAIN LOOP
     for epoch in range(start_epoch, num_epochs):
         logger.info('Epoch %d' % (epoch + 1))
-        train_acc = run_one_epoch(
+        train_loss = run_one_epoch(
             device=device,
             training=True,
-            num_temporal_views=eval_num_segments if attend_across_segments else 1,
-            attend_across_segments=attend_across_segments,
-            num_spatial_views=1,
             encoder=encoder,
-            classifier=classifier,
-            scaler=scaler,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            wd_scheduler=wd_scheduler,
+            diffusion_model=diffusion_model,
+            diffusion_optimizer=diffusion_optimizer,
+            diffusion_scheduler=diffusion_scheduler,
+            diffusion_wd_scheduler=diffusion_wd_scheduler,
+            diffusion_scaler=diffusion_scaler,
             data_loader=train_loader,
             use_bfloat16=use_bfloat16)
 
-        val_acc = run_one_epoch(
+        val_loss = run_one_epoch(
             device=device,
             training=False,
-            num_temporal_views=eval_num_segments,
-            attend_across_segments=attend_across_segments,
-            num_spatial_views=eval_num_views_per_segment,
             encoder=encoder,
-            classifier=classifier,
-            scaler=scaler,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            wd_scheduler=wd_scheduler,
+            diffusion_model=diffusion_model,
+            diffusion_optimizer=diffusion_optimizer,
+            diffusion_scheduler=diffusion_scheduler,
+            diffusion_wd_scheduler=diffusion_wd_scheduler,
+            diffusion_scaler=diffusion_scaler,
             data_loader=val_loader,
             use_bfloat16=use_bfloat16)
 
-        logger.info('[%5d] train: %.3f%% test: %.3f%%' % (epoch + 1, train_acc, val_acc))
+        logger.info('[%5d] train loss: %.3f val loss: %.3f' % (epoch + 1, train_loss, val_loss))
         if rank == 0:
-            csv_logger.log(epoch + 1, train_acc, val_acc)
+            csv_logger.log(epoch + 1, train_loss, val_loss)
         save_checkpoint(epoch + 1)
-
 
 def run_one_epoch(
     device,
     training,
     encoder,
-    classifier,
+    diffusion_model,
     scaler,
     optimizer,
     scheduler,
     wd_scheduler,
     data_loader,
     use_bfloat16,
-    num_spatial_views,
-    num_temporal_views,
-    attend_across_segments,
 ):
-
-    classifier.train(mode=training)
-    criterion = torch.nn.CrossEntropyLoss()
-    top1_meter = AverageMeter()
+    diffusion_model.train(mode=training)
+    criterion = torch.nn.MSELoss()
+    loss_meter = AverageMeter()
     for itr, data in enumerate(data_loader):
 
         if training:
@@ -323,79 +392,55 @@ def run_one_epoch(
         with torch.cuda.amp.autocast(dtype=torch.float16, enabled=use_bfloat16):
 
             # Load data and put on GPU
-            clips = [
-                [dij.to(device, non_blocking=True) for dij in di]  # iterate over spatial views of clip
-                for di in data[0]  # iterate over temporal index of clip
-            ]
-            clip_indices = [d.to(device, non_blocking=True) for d in data[2]]
-            labels = data[1].to(device)
-            batch_size = len(labels)
+            # Assume data[0] contains the videos
+            videos = [di[0] for di in data[0]]  # di[0] because we have only one spatial view
+            videos = torch.stack(videos).to(device)  # Shape: (B, C, T, H, W)
+            batch_size = videos.shape[0]
 
-            # Forward and prediction
+            # Apply masking to videos (excluding last frame)
+            masked_videos = apply_masking(videos[:, :, :-1, :, :])  # Shape: (B, C, T-1, H, W)
+
+            # Get target frames (last frame)
+            target_frames = videos[:, :, -1, :, :]  # Shape: (B, C, H, W)
+
+            # Process masked_videos through encoder to get embeddings
             with torch.no_grad():
-                outputs = encoder(clips, clip_indices)
-                h = F.layer_norm(outputs, (h.size(-1),))  # [B, N, D]
+                embeddings = encoder(masked_videos)  # Shape: (B, D)
+                embeddings = embeddings.unsqueeze(1)  # Shape: (B, 1, D)
 
-                # Compute tokens per frame and delta tokens
-                B, N, D = h.size()
-                tokens_per_frame = N // num_frames
-                delta_tokens = tokens_per_frame * delta_frames
-                num_groups = N // delta_tokens
+            # Forward pass through diffusion model
+            noise_pred, noise = diffusion_model.forward(target_frames, masked_embedding=embeddings)
 
-                # Reshape and average pool over delta_tokens
-                h_grouped = h.view(B, num_groups, delta_tokens, D)
-                h_pooled = h_grouped.mean(dim=2)  # [B, num_groups, D]
-                action_cls_tokens = action_mlp(h_pooled)  # [B, num_groups, D]
-                if not training:
-                    if attend_across_segments:
-                        outputs = [classifier(o) for o in outputs]
-                    else:
-                        outputs = [[classifier(ost) for ost in os] for os in outputs]
-            if training:
-                if attend_across_segments:
-                    outputs = [classifier(o) for o in outputs]
-                else:
-                    outputs = [[classifier(ost) for ost in os] for os in outputs]
-
-        # Compute loss
-        if attend_across_segments:
-            loss = sum([criterion(o, labels) for o in outputs]) / len(outputs)
-        else:
-            loss = sum([sum([criterion(ost, labels) for ost in os]) for os in outputs]) / len(outputs) / len(outputs[0])
-        with torch.no_grad():
-            if attend_across_segments:
-                outputs = sum([F.softmax(o, dim=1) for o in outputs]) / len(outputs)
-            else:
-                outputs = sum([sum([F.softmax(ost, dim=1) for ost in os]) for os in outputs]) / len(outputs) / len(outputs[0])
-            top1_acc = 100. * outputs.max(dim=1).indices.eq(labels).sum() / batch_size
-            top1_acc = float(AllReduce.apply(top1_acc))
-            top1_meter.update(top1_acc)
+            # Compute loss
+            loss = criterion(noise_pred, noise)
+            loss_value = loss.item()
+            loss_meter.update(loss_value)
 
         if training:
+            optimizer.zero_grad()
             if use_bfloat16:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(classifier.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(diffusion_model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(classifier.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(diffusion_model.parameters(), 1.0)
                 optimizer.step()
-            optimizer.zero_grad()
 
         if itr % 20 == 0:
-            logger.info('[%5d] %.3f%% (loss: %.3f) [mem: %.2e]'
-                        % (itr, top1_meter.avg, loss,
+            logger.info('[%5d] loss: %.3f [mem: %.2e]'
+                        % (itr, loss_meter.avg,
                            torch.cuda.max_memory_allocated() / 1024.**2))
 
-    return top1_meter.avg
+    return loss_meter.avg
 
 
 def load_checkpoint(
     device,
     r_path,
-    classifier,
+    model,
     opt,
     scaler
 ):
@@ -403,10 +448,10 @@ def load_checkpoint(
         checkpoint = torch.load(r_path, map_location=torch.device('cpu'))
         epoch = checkpoint['epoch']
 
-        # -- loading encoder
-        pretrained_dict = checkpoint['classifier']
-        msg = classifier.load_state_dict(pretrained_dict)
-        logger.info(f'loaded pretrained classifier from epoch {epoch} with msg: {msg}')
+        # -- loading model
+        pretrained_dict = checkpoint['diffusion_model']
+        msg = model.load_state_dict(pretrained_dict)
+        logger.info(f'loaded pretrained diffusion model from epoch {epoch} with msg: {msg}')
 
         # -- loading optimizer
         opt.load_state_dict(checkpoint['opt'])
@@ -420,8 +465,7 @@ def load_checkpoint(
         logger.info(f'Encountered exception when loading checkpoint {e}')
         epoch = 0
 
-    return classifier, opt, scaler, epoch
-
+    return model, opt, scaler, epoch
 
 def load_pretrained(
     encoder,
@@ -444,12 +488,10 @@ def load_pretrained(
             logger.info(f'key "{k}" is of different shape in model and loaded state dict')
             pretrained_dict[k] = v
     msg = encoder.load_state_dict(pretrained_dict, strict=False)
-    print(encoder)
     logger.info(f'loaded pretrained model with msg: {msg}')
     logger.info(f'loaded pretrained encoder from epoch: {checkpoint["epoch"]}\n path: {pretrained}')
     del checkpoint
     return encoder
-
 
 def make_dataloader(
     root_path,
@@ -499,7 +541,6 @@ def make_dataloader(
         subset_file=subset_file)
     return data_loader
 
-
 def init_model(
     device,
     pretrained,
@@ -530,9 +571,8 @@ def init_model(
     encoder = load_pretrained(encoder=encoder, pretrained=pretrained, checkpoint_key=checkpoint_key)
     return encoder
 
-
 def init_opt(
-    classifier,
+    model,
     iterations_per_epoch,
     start_lr,
     ref_lr,
@@ -545,10 +585,10 @@ def init_opt(
 ):
     param_groups = [
         {
-            'params': (p for n, p in classifier.named_parameters()
+            'params': (p for n, p in model.named_parameters()
                        if ('bias' not in n) and (len(p.shape) != 1))
         }, {
-            'params': (p for n, p in classifier.named_parameters()
+            'params': (p for n, p in model.named_parameters()
                        if ('bias' in n) or (len(p.shape) == 1)),
             'WD_exclude': True,
             'weight_decay': 0

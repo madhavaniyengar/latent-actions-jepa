@@ -12,15 +12,16 @@ import torch
 import torch.nn as nn
 
 from src.models.utils.modules import Block
-from src.models.utils.pos_embs import get_2d_sincos_pos_embed, get_3d_sincos_pos_embed, get_1d_sincos_pos_embed_from_grid
+from src.models.utils.pos_embs import get_2d_sincos_pos_embed, get_3d_sincos_pos_embed
 from src.utils.tensors import (
     trunc_normal_,
     repeat_interleave_batch
 )
 from src.masks.utils import apply_masks
 
+
 class VisionTransformerPredictor(nn.Module):
-    """ Modified predictor """
+    """ Vision Transformer """
     def __init__(
         self,
         img_size=224,
@@ -42,20 +43,9 @@ class VisionTransformerPredictor(nn.Module):
         use_mask_tokens=False,
         num_mask_tokens=2,
         zero_init_mask_tokens=True,
-        delta_frames=1,
-        clip_embed_dim=1024,
-        temporal_patch_size=2,
         **kwargs
     ):
         super().__init__()
-        self.delta_frames = delta_frames
-        self.num_frames = num_frames
-        self.num_action_tokens = (self.num_frames // temporal_patch_size)
-        self.action_pos_embed = nn.Parameter(
-            torch.zeros(1, self.num_action_tokens, predictor_embed_dim),
-            requires_grad=False
-            )
-        self.predictor_embed_dim = predictor_embed_dim
         # Map input to predictor dimension
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
 
@@ -72,6 +62,7 @@ class VisionTransformerPredictor(nn.Module):
         # Determine positional embedding
         self.input_size = img_size
         self.patch_size = patch_size
+        # --
         self.num_frames = num_frames
         self.tubelet_size = tubelet_size
         self.is_video = num_frames > 1
@@ -92,6 +83,7 @@ class VisionTransformerPredictor(nn.Module):
             )
         # Position embedding
         self.uniform_power = uniform_power
+        self.predictor_pos_embed = None
         self.predictor_pos_embed = nn.Parameter(
             torch.zeros(1, num_patches, predictor_embed_dim),
             requires_grad=False)
@@ -138,13 +130,6 @@ class VisionTransformerPredictor(nn.Module):
                 cls_token=False,
                 uniform_power=self.uniform_power
             )
-            # Initialize action_pos_embed
-            action_positions = torch.arange(self.num_action_tokens).unsqueeze(0)
-            action_sincos = torch.tensor(get_1d_sincos_pos_embed_from_grid(
-                embed_dim,
-                action_positions,
-            ))
-            self.action_pos_embed.data.copy_(action_sincos)
         else:
             sincos = get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False)
         pos_embed.copy_(torch.from_numpy(sincos).float().unsqueeze(0))
@@ -184,16 +169,16 @@ class VisionTransformerPredictor(nn.Module):
         # Normalize features and apply noise
         x = torch.nn.functional.layer_norm(x, (x.size(-1),))
         x = alpha**0.5 * x + (1.-alpha)**0.5 * torch.randn(x.shape, device=x.device)
-        return x 
+        return x
 
-    def forward(self, ctxt, tgt, masks_ctxt, masks_tgt, action_cls_tokens, mask_index=1):
+    def forward(self, ctxt, tgt, masks_ctxt, masks_tgt, mask_index=1):
         """
         :param ctxt: context tokens
         :param tgt: target tokens
         :param masks_ctxt: indices of context tokens in input
-        :param masks_tgt: indices of target tokens in input
-        :param action_cls_tokens: Action CLS tokens to append
+        :params masks_tgt: indices of target tokens in input
         """
+
         assert (masks_ctxt is not None) and (masks_tgt is not None), 'Cannot run predictor without mask indices'
 
         if not isinstance(masks_ctxt, list):
@@ -205,19 +190,16 @@ class VisionTransformerPredictor(nn.Module):
         # Batch Size
         B = len(ctxt) // len(masks_ctxt)
 
-        # Map context tokens to predictor dimensions
+        # Map context tokens to pedictor dimensions
         x = self.predictor_embed(ctxt)
         _, N_ctxt, D = x.shape
-        
-        # map action tokens to predictor dimensions
-        action_cls_tokens = self.predictor_embed(action_cls_tokens)
 
-        # Add positional embedding to context tokens
+        # Add positional embedding to ctxt tokens
         if self.predictor_pos_embed is not None:
             ctxt_pos_embed = self.predictor_pos_embed.repeat(B, 1, 1)
             x += apply_masks(ctxt_pos_embed, masks_ctxt)
 
-        # Map target tokens to predictor dimensions & add noise (forward diffusion)
+        # Map target tokens to predictor dimensions & add noise (fwd diffusion)
         if self.mask_tokens is None:
             pred_tokens = self.predictor_embed(tgt)
             pred_tokens = self.diffusion(pred_tokens)
@@ -236,39 +218,22 @@ class VisionTransformerPredictor(nn.Module):
 
         # Concatenate context & target tokens
         x = x.repeat(len(masks_tgt), 1, 1)
-        x = torch.cat([x, pred_tokens], dim=1)  # [B, N_ctxt + N_tgt, D]
+        x = torch.cat([x, pred_tokens], dim=1)
 
-        # Compute tokens per frame and delta tokens
-        B = x.size(0)
-        p = action_cls_tokens.size(1) - 1
-        # action_cls_tokens = action_cls_tokens.repeat(B // action_cls_tokens.size(0), 1, 1)  # Match batch size
-
-        # Add positional embeddings to action_cls_tokens
-        action_pos_embed = self.action_pos_embed.repeat(B, 1, 1)
-        action_pos_embed = action_pos_embed[:, :p, :]
-        # concat a single layer of zeros for the text token
-        action_pos_embed = torch.cat([action_pos_embed, torch.zeros(B, 1, self.predictor_embed_dim, device=action_pos_embed.device)], dim=1)
-        action_cls_tokens += action_pos_embed
-
-        # Append action_cls_tokens to x
-        x = torch.cat([x, action_cls_tokens], dim=1)  # [B, N_ctxt + N_tgt + N_action, D]
-
-        # Adjust masks accordingly
+        # FIXME: this implementation currently assumes masks_ctxt and masks_tgt
+        # are alligned 1:1 (ok with MultiMask wrapper on predictor but
+        # otherwise will break)
         masks_ctxt = torch.cat(masks_ctxt, dim=0)
         masks_tgt = torch.cat(masks_tgt, dim=0)
-        masks = torch.cat([masks_ctxt, masks_tgt], dim=1)  # [B, N_ctxt + N_tgt]
+        masks = torch.cat([masks_ctxt, masks_tgt], dim=1)
 
-        # Create masks for action tokens (unmasked)
-        action_masks = torch.ones(B, self.num_action_tokens, dtype=torch.bool, device=x.device)
-        masks = torch.cat([masks, action_masks], dim=1)  # [B, N_ctxt + N_tgt + N_action]
-
-        # Forward pass through predictor blocks
+        # Fwd prop
         for blk in self.predictor_blocks:
             x = blk(x, mask=masks)
         x = self.predictor_norm(x)
 
         # Return output corresponding to target tokens
-        x = x[:, N_ctxt:N_ctxt + pred_tokens.size(1)]  # Exclude action tokens
+        x = x[:, N_ctxt:]
         x = self.predictor_proj(x)
 
         return x

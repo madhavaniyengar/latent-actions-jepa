@@ -23,9 +23,13 @@ parser.add_argument(
 parser.add_argument(
     '--devices', type=str, nargs='+', default=['cuda:0'],
     help='which devices to use on local machine')
+parser.add_argument(
+    '--train_script',type=str, default='train',
+    help='which script to run (train or train_causal_mask)')
 
 
-def process_main(rank, fname, world_size, devices):
+
+def process_main(rank, fname, world_size, devices, train_script):
     import os
     os.environ['CUDA_VISIBLE_DEVICES'] = str(devices[rank].split(':')[-1])
 
@@ -57,7 +61,7 @@ def process_main(rank, fname, world_size, devices):
     logger.info(f'Running... (rank: {rank}/{world_size})')
 
     # Launch the app with loaded config
-    app_main(params['app'], args=params)
+    app_main(params['app'], args=params, train_script=train_script)
 
 
 if __name__ == '__main__':
@@ -67,5 +71,5 @@ if __name__ == '__main__':
     for rank in range(num_gpus):
         mp.Process(
             target=process_main,
-            args=(rank, args.fname, num_gpus, args.devices)
+            args=(rank, args.fname, num_gpus, args.devices, args.train_script)
         ).start()

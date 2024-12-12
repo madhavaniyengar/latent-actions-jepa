@@ -12,6 +12,8 @@ import yaml
 
 
 import torch
+import torch.nn as nn
+import math
 
 import src.models.vision_transformer as video_vit
 import src.models.predictor as vit_pred
@@ -25,6 +27,45 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
 
 
+class PositionalEncoding(nn.Module):
+            def __init__(self, d_model, dropout=0.1, max_len=5000):
+                super(PositionalEncoding, self).__init__()
+                self.dropout = nn.Dropout(p=dropout)
+
+                pe = torch.zeros(max_len, d_model)
+                position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+                div_term = torch.exp(
+                    torch.arange(0, d_model, 2).float()
+                    * (-math.log(10000.0) / d_model)
+                )
+                pe[:, 0::2] = torch.sin(position * div_term)
+                pe[:, 1::2] = torch.cos(position * div_term)
+                pe = pe.unsqueeze(0)  # Shape (1, max_len, d_model)
+                self.register_buffer('pe', pe)
+
+            def forward(self, x):
+                x = x + self.pe[:, : x.size(1)].to(x.device)
+                return self.dropout(x)
+
+class ActionTransformer(nn.Module):
+    def __init__(self, action_dim, nhead=4, num_layers=2, dropout=0.1):
+        super(ActionTransformer, self).__init__()
+        self.pos_encoder = PositionalEncoding(action_dim, dropout)
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=action_dim, nhead=nhead, dropout=dropout
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layers, num_layers=num_layers
+        )
+
+    def forward(self, x):
+        # x shape: (batch_size, seq_len, action_dim)
+        x = x.permute(1, 0, 2)  # Convert to (seq_len, batch_size, action_dim)
+        x = self.pos_encoder(x)
+        output = self.transformer_encoder(x)
+        output = output.permute(1, 0, 2)  # Back to (batch_size, seq_len, action_dim)
+        return output
+
 def load_checkpoint(
     r_path,
     encoder,
@@ -32,6 +73,7 @@ def load_checkpoint(
     target_encoder,
     opt,
     scaler,
+    action_model=None,
 ):
     try:
         checkpoint = torch.load(r_path, map_location=torch.device('cpu'))
@@ -51,6 +93,11 @@ def load_checkpoint(
         pretrained_dict = checkpoint['predictor']
         msg = predictor.load_state_dict(pretrained_dict)
         logger.info(f'loaded pretrained predictor from epoch {epoch} with msg: {msg}')
+
+        if action_model:
+            pretrained_dict = checkpoint['action_model']  # Added action_mlp loading
+            msg = action_model.load_state_dict(pretrained_dict)
+            logger.info(f'loaded pretrained action_mlp from epoch {epoch} with msg: {msg}')
 
         # -- loading target_encoder
         if target_encoder is not None:
@@ -92,11 +139,15 @@ def init_video_model(
     crop_size=224,
     pred_depth=6,
     pred_embed_dim=384,
+    action_dim=1024,  
     uniform_power=False,
     use_mask_tokens=False,
     num_mask_tokens=2,
     zero_init_mask_tokens=True,
     use_sdpa=False,
+    delta_frames=1,
+    clip_embed_dim=512,
+    action_transformer=False,
 ):
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
@@ -121,8 +172,22 @@ def init_video_model(
         num_mask_tokens=num_mask_tokens,
         zero_init_mask_tokens=zero_init_mask_tokens,
         use_sdpa=use_sdpa,
+        delta_frames=delta_frames,
+        clip_embed_dim=clip_embed_dim
     )
     predictor = PredictorMultiMaskWrapper(predictor)
+
+    # Initialize action_mlp
+    if action_transformer:
+        # Initialize action_transformer
+        action_model = ActionTransformer(action_dim=action_dim, nhead=4, num_layers=2)
+    else:
+        action_model = torch.nn.Sequential(
+            torch.nn.Linear(action_dim, action_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(action_dim, action_dim)
+        )
+    action_model.to(device)
 
     def init_weights(m):
         if isinstance(m, torch.nn.Linear):
@@ -139,23 +204,32 @@ def init_video_model(
     for m in predictor.modules():
         init_weights(m)
 
+    for m in action_model.modules():
+        init_weights(m)
+
     encoder.to(device)
     predictor.to(device)
+    action_model.to(device) 
+
     logger.info(encoder)
     logger.info(predictor)
+    logger.info(action_model)  
 
     def count_parameters(model):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     logger.info(f'Encoder number of parameters: {count_parameters(encoder)}')
     logger.info(f'Predictor number of parameters: {count_parameters(predictor)}')
+    logger.info(f'Action MLP number of parameters: {count_parameters(action_model)}')
 
-    return encoder, predictor
+    return encoder, predictor, action_model
+
 
 
 def init_opt(
     encoder,
     predictor,
+    action_model,
     iterations_per_epoch,
     start_lr,
     ref_lr,
@@ -184,6 +258,12 @@ def init_opt(
             'weight_decay': 0,
         }, {
             'params': (p for n, p in predictor.named_parameters()
+                       if ('bias' in n) or (len(p.shape) == 1)),
+            'WD_exclude': zero_init_bias_wd,
+            'weight_decay': 0,
+        },
+        {
+            'params': (p for n, p in action_model.named_parameters()
                        if ('bias' in n) or (len(p.shape) == 1)),
             'WD_exclude': zero_init_bias_wd,
             'weight_decay': 0,
