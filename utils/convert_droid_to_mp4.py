@@ -12,8 +12,8 @@ os.makedirs(output_dir, exist_ok=True)
 csv_path = os.path.join(output_dir, "video_labels.csv")
 # dataset_name = "droid_100"
 dataset_name = 'droid'
-# dataset_dir = "/home/madhavan/latent_actions/data/droid"  
-dataset_dir = '/data/droid/'
+dataset_dir = "/home/madhavan/latent_actions/data/droid"  
+# dataset_dir = '/data/droid/'
 dataset = tfds.load(dataset_name, data_dir=dataset_dir, split="train") 
 
 # Open CSV file to log video paths and labels

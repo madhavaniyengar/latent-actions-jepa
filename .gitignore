@@ -7,3 +7,5 @@ logging/
 ckpts/
 .vscode/
 dist/
+data/
+environment.yml

@@ -184,7 +184,7 @@ class _MaskGenerator(object):
         collated_masks_pred, collated_masks_enc = [], []
         min_keep_enc = min_keep_pred = self.duration * self.height * self.width
 
-        p = random.randint(0, self.duration)
+        p = random.randint(1, self.duration - 1)
         for _ in range(batch_size):
 
             empty_context = True

@@ -1,12 +1,12 @@
 app: vjepa
-nodes: 16
-tasks_per_node: 8
+nodes: 1
+tasks_per_node: 1
 data:
   dataset_type: VideoDataset
   datasets:
     - /home/madhavan/jepa/droid_videos/video_labels.csv
   decode_one_clip: true
-  batch_size: 24 # 24 -> 2
+  batch_size: 25 # 24 -> 2
   num_clips: 1
   num_frames: 16
   tubelet_size: 2
@@ -14,7 +14,7 @@ data:
   crop_size: 224
   patch_size: 16
   pin_mem: true
-  num_workers: 12
+  num_workers: 0
   filter_short_videos: false
   clip_duration: null
   mask_type: 'random_p'
@@ -30,7 +30,7 @@ data_aug:
   reprob: 0.0
 logging:
   folder: /home/madhavan/jepa/logging/
-  write_tag: debug_sample_p
+  write_tag: sample_p_6837datapts
 loss:
   loss_exp: 1.0
   reg_coeff: 0.0
@@ -77,7 +77,7 @@ model:
   zero_init_mask_tokens: true
   action_dim: 1024
 optimization:
-  ipe: 300
+  # ipe: 300
   ipe_scale: 1.25
   clip_grad: 10.0
   weight_decay: 0.04

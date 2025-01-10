@@ -376,7 +376,56 @@ def main(args, resume_preempt=False):
             logger.info(f'Encountered exception when saving checkpoint: {e}')
 
     logger.info('Initializing loader...')
-    loader = iter(unsupervised_loader)
+    
+    logger.info(f'len unsupervised loader, {len(unsupervised_loader)}')
+    
+    # remove the last item in the unsupervised_loader to ensure all batches are the same size
+    
+    # for batch_idx, (udata, masks_enc, masks_pred, p) in enumerate(unsupervised_loader):
+    #     print('here', batch_idx)
+    #     logger.info(f'Batch {batch_idx}:')
+        
+    #     # Log shapes of all clips and masks
+    #     logger.info(f'  udata[0] (clips) shapes: {[clip.shape for clip in udata[0]]}')
+    #     logger.info(f'  udata[1] (labels): {udata[1]}')
+    #     logger.info(f'  Number of encoder masks: {len(masks_enc)}')
+    #     logger.info(f'  Number of predictor masks: {len(masks_pred)}')
+    #     logger.info(f'  Encoder mask shapes: {[mask.shape for mask in masks_enc]}')
+    #     logger.info(f'  Predictor mask shapes: {[mask.shape for mask in masks_pred]}')
+    #     logger.info(f'  Sampling parameter (p): {p}')
+        
+    # for batch_idx, (udata, masks_enc, masks_pred, p) in enumerate(unsupervised_loader):
+    #     print('here', batch_idx)
+    #     logger.info(f'Batch {batch_idx}:')
+        
+    #     # Log shapes of all clips and masks
+    #     logger.info(f'  udata[0] (clips) shapes: {[clip.shape for clip in udata[0]]}')
+    #     logger.info(f'  udata[1] (labels): {udata[1]}')
+    #     logger.info(f'  Number of encoder masks: {len(masks_enc)}')
+    #     logger.info(f'  Number of predictor masks: {len(masks_pred)}')
+    #     logger.info(f'  Encoder mask shapes: {[mask.shape for mask in masks_enc]}')
+    #     logger.info(f'  Predictor mask shapes: {[mask.shape for mask in masks_pred]}')
+    #     logger.info(f'  Sampling parameter (p): {p}')
+    # exit()
+    
+    # test the loader
+    logger.info('Testing loader...')
+    # print out shape of all data in the loader
+    
+    # while True:
+    #     try:
+    #         udata, masks_enc, masks_pred, p = next(loader)
+    #         logger.info(f'Loaded data with shape {udata[0][0].shape}')
+    #     except Exception as e:
+    #         logger.info(f'Encountered exception when loading data: {e}')
+    #         loader = iter(unsupervised_loader)
+    #         udata, masks_enc, masks_pred, p = next(loader)
+    #     assert len(masks_enc) == len(masks_pred), \
+    #         'Currently require num encoder masks = num predictor masks'
+    #     if len(udata[0]) == batch_size:
+    #         logger.info(f'Batch size {len(udata[0])} is equal to {batch_size}.')
+    #     else:
+    #         logger.info(f'Batch size {len(udata[0])} is not equal to {batch_size}. Retrying...')
 
     if skip_batches > 0:
         logger.info(f'Skip {skip_batches} batches')
@@ -407,6 +456,7 @@ def main(args, resume_preempt=False):
         wall_time_meter = AverageMeter()
 
         for itr in range(ipe):
+            print('epoch', epoch, 'itr', itr)
             itr_start_time = time.time()
 
             try:

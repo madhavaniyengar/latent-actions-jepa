@@ -79,7 +79,7 @@ def make_videodataset(
         collate_fn=collator,
         sampler=dist_sampler,
         batch_size=batch_size,
-        drop_last=drop_last,
+        drop_last=True,
         pin_memory=pin_mem,
         num_workers=num_workers,
         persistent_workers=num_workers > 0)
