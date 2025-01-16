@@ -108,6 +108,7 @@ def main(args, resume_preempt=False):
     dataset_type = cfgs_data.get('dataset_type', 'videodataset')
     mask_type = cfgs_data.get('mask_type', 'multiblock3d')
     dataset_paths = cfgs_data.get('datasets', [])
+    eval_dataset_paths = cfgs_data.get('eval_datasets', None)
     datasets_weights = cfgs_data.get('datasets_weights', None)
     if datasets_weights is not None:
         assert len(datasets_weights) == len(dataset_paths), 'Must have one sampling weight specified for each dataset'
@@ -205,9 +206,18 @@ def main(args, resume_preempt=False):
         ('%d', 'gpu-time(ms)'),
         ('%d', 'wall-time(ms)'),
     )
+    
+    eval_log_file = os.path.join(folder, f'{tag}_eval_r{rank}.csv')
+    eval_csv_logger = CSVLogger(
+        eval_log_file,
+        ('%d', 'epoch'),
+        ('%.5f', 'eval_loss'),
+        ('%.5f', 'eval_loss_jepa'),
+        ('%.5f', 'eval_loss_reg'),
+    )
 
     # -- init model
-    encoder, predictor, action_mlp = init_video_model(
+    encoder, predictor, action_model = init_video_model(
         uniform_power=uniform_power,
         use_mask_tokens=use_mask_tokens,
         num_mask_tokens=len(cfgs_mask),
@@ -223,7 +233,8 @@ def main(args, resume_preempt=False):
         action_dim=action_dim,
         use_sdpa=use_sdpa,
         delta_frames=delta_frames,
-        clip_embed_dim=512
+        clip_embed_dim=512,
+        action_transformer=True,
     )
     target_encoder = copy.deepcopy(encoder)
 
@@ -281,12 +292,36 @@ def main(args, resume_preempt=False):
     if ipe is None:
         ipe = _dlen
     logger.info(f'iterations per epoch/dataest length: {ipe}/{_dlen}')
+    
+    eval_batch_size = 4  # for instance, use a smaller batch
+    (eval_loader,
+     eval_sampler) = init_data(
+         data=dataset_type,
+         root_path=eval_dataset_paths,
+         batch_size=eval_batch_size,
+         training=False,  # disable random sampling, shuffling, etc.
+         clip_len=num_frames,
+         frame_sample_rate=sampling_rate,
+         filter_short_videos=filter_short_videos,
+         decode_one_clip=decode_one_clip,
+         duration=duration,
+         num_clips=num_clips,
+         transform=transform,
+         datasets_weights=None,  # usually not needed for evaluation
+         collator=mask_collator,
+         num_workers=0,
+         world_size=1,    # often just evaluate on a single GPU
+         pin_mem=False,
+         rank=0,
+         log_dir=None
+    )
 
     # -- init optimizer and scheduler
     optimizer, scaler, scheduler, wd_scheduler = init_opt(
         encoder=encoder,
         predictor=predictor,
-        action_mlp=action_mlp,
+        action_model=action_model,
+        token_learner=None,
         wd=wd,
         final_wd=final_wd,
         start_lr=start_lr,
@@ -301,7 +336,7 @@ def main(args, resume_preempt=False):
         eps=eps)
     encoder = DistributedDataParallel(encoder, static_graph=True)
     predictor = DistributedDataParallel(predictor, static_graph=True)
-    action_mlp = DistributedDataParallel(action_mlp, static_graph=True)
+    action_model = DistributedDataParallel(action_model, static_graph=True)
     target_encoder = DistributedDataParallel(target_encoder)
     for p in target_encoder.parameters():
         p.requires_grad = False
@@ -309,7 +344,7 @@ def main(args, resume_preempt=False):
         p.requires_grad = True
     for p in predictor.parameters():
         p.requires_grad = True
-    for p in action_mlp.parameters():
+    for p in action_model.parameters():
         p.requires_grad = True
         
         
@@ -350,7 +385,7 @@ def main(args, resume_preempt=False):
         save_dict = {
             'encoder': encoder.state_dict(),
             'predictor': predictor.state_dict(),
-            'action_mlp': action_mlp.state_dict(),
+            'action_model': action_model.state_dict(),
             'opt': optimizer.state_dict(),
             'scaler': None if scaler is None else scaler.state_dict(),
             'target_encoder': target_encoder.state_dict(),
@@ -379,7 +414,91 @@ def main(args, resume_preempt=False):
             except Exception:
                 loader = iter(unsupervised_loader)
                 udata = next(loader)
+    def evaluate(
+            encoder, predictor, action_model, target_encoder,
+            data_loader, device, clip_model, clip_tokenizer, dtype, mixed_precision
+        ):
+            """Run evaluation (forward pass only) on a small subset."""
+            encoder.eval()
+            predictor.eval()
+            action_model.eval()
+            target_encoder.eval()
 
+            eval_loss_meter = AverageMeter()
+            eval_jepa_meter = AverageMeter()
+            eval_reg_meter = AverageMeter()
+
+            with torch.no_grad():
+                for batch_idx, (udata, masks_enc, masks_pred, p) in enumerate(data_loader):
+                    # Move data to GPU
+                    clips = torch.cat([u.to(device, non_blocking=True) for u in udata[0]], dim=0)
+                    labels = udata[1]
+                    labels = [' '.join(l.split('_')) for l in labels]
+                    input_ids = clip_tokenizer(labels, padding=True, return_tensors='pt').input_ids.to(device)
+
+                    with torch.no_grad():
+                        text_embeddings = clip_model(input_ids).last_hidden_state
+                    text_embeddings = text_embeddings.mean(dim=1, keepdim=True)
+
+                    # Prepare masks
+                    _masks_enc, _masks_pred = [], []
+                    for _me, _mp in zip(masks_enc, masks_pred):
+                        _me = _me.to(device, non_blocking=True)
+                        _mp = _mp.to(device, non_blocking=True)
+                        _me = repeat_interleave_batch(_me, B=len(udata[0]), repeat=num_clips)
+                        _mp = repeat_interleave_batch(_mp, B=len(udata[0]), repeat=num_clips)
+                        _masks_enc.append(_me)
+                        _masks_pred.append(_mp)
+
+                    # forward passes
+                    with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+                        # target encoding (no gradient)
+                        h = target_encoder(clips)
+                        h = F.layer_norm(h, (h.size(-1),)) 
+                        h_splits = apply_masks(h, _masks_pred, concat=False)
+
+                        # context encoding
+                        z_splits = encoder(clips, _masks_enc)
+
+                        # apply action model
+                        per_frame_embeddings = [
+                            seq.reshape(seq.size(0), pi, seq.size(1)//pi, seq.size(-1)) 
+                            for seq, pi in zip(z_splits, p)
+                        ]
+                        per_frame_embeddings = [pfe.mean(dim=2) for pfe in per_frame_embeddings]
+                        action_model_input = [
+                            torch.cat([text_embeddings.repeat(1, 1, 2), pfe], dim=1) 
+                            for pfe in per_frame_embeddings
+                        ]
+                        action_cls_tokens = [action_model(ami) for ami in action_model_input]
+
+                        # predictor
+                        z_pred_splits = predictor(z_splits, h_splits, _masks_enc, _masks_pred, action_cls_tokens)
+
+                        # compute jepa loss
+                        loss_jepa = 0.
+                        for zi, hi in zip(z_pred_splits, h_splits):
+                            loss_jepa += torch.mean(torch.abs(zi - hi)**loss_exp) / loss_exp
+                        loss_jepa /= len(_masks_pred)
+
+                        # compute regularization
+                        pstd_z = sum([torch.sqrt(zi.var(dim=1) + 0.0001) for zi in z_pred_splits]) / len(z_pred_splits)
+                        loss_reg = torch.mean(F.relu(1. - pstd_z))
+
+                        loss_eval = loss_jepa + reg_coeff * loss_reg
+
+                    eval_loss_meter.update(loss_eval.item())
+                    eval_jepa_meter.update(loss_jepa.item())
+                    eval_reg_meter.update(loss_reg.item())
+
+            # restore train mode
+            encoder.train()
+            predictor.train()
+            action_model.train()
+            target_encoder.train()
+
+            return eval_loss_meter.avg, eval_jepa_meter.avg, eval_reg_meter.avg
+    
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
         logger.info('Epoch %d' % (epoch + 1))
@@ -447,43 +566,33 @@ def main(args, resume_preempt=False):
                 _new_wd = wd_scheduler.step()
                 # --
 
-                def forward_target(c, text_embeddings):
+                def forward_target(c):
                     """
-                    Returns list of tensors of shape [B, N, D], one for each mask-pred.
+                    Returns list of tensors of shape [B, N, D], one for each
+                    mask-pred.
                     """
                     with torch.no_grad():
                         h = target_encoder(c)
-                        h = F.layer_norm(h, (h.size(-1),))  # [B, N, D]
-
-                        # Compute tokens per frame and delta tokens
-                        B, N, D = h.size()
-                        tokens_per_frame = N // num_frames
-                        delta_tokens = tokens_per_frame * delta_frames
-                        num_groups = N // delta_tokens
-
-                        # Reshape and average pool over delta_tokens
-                        h_grouped = h.view(B, num_groups, delta_tokens, D)
-                        h_pooled = h_grouped.mean(dim=2)  # [B, num_groups, D]
-                        
-                        # append text embeddings to h_pooled
-                        text_embeddings = text_embeddings.repeat(1, 1, 2)
-                        h_pooled = torch.cat([h_pooled, text_embeddings], dim=1) # [B, num_groups+1, D]
-
-                    # Pass through action_mlp to get Action CLS tokens
-                    action_cls_tokens = action_mlp(h_pooled)  # [B, num_groups+1, D]
-
-                    # Apply masks to h
-                    h = apply_masks(h, masks_pred, concat=False)
-
-                    return h, action_cls_tokens
+                        h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim  [B, N, D]
+                        # -- create targets (masked regions of h)
+                        h = apply_masks(h, masks_pred, concat=False)
+                        return h
 
 
-                def forward_context(c, action_cls_tokens):
+                def forward_context(c, text_embeddings, p):
                     """
                     Returns list of tensors of shape [B, N, D], one for each mask-pred.
                     """
                     z = encoder(c, masks_enc)  # [B, N_z, D]
-                    action_cls_tokens = [action_cls_tokens for _ in range(len(masks_pred))]
+                    
+                    # pool each patch by the frame it corresponds to 
+                    per_frame_embeddings = [seq.reshape(seq.size(0), pi, seq.size(1) // pi, seq.size(-1)) for seq, pi in zip(z, p)]
+                    per_frame_embeddings = [pfe.mean(dim=2) for pfe in per_frame_embeddings]  # [B, num_frames, D]
+                    # concat text embeddings with per_frame_embeddings
+                    action_model_input = [torch.cat([text_embeddings.repeat(1, 1, 2), pfe], dim=1) for pfe in per_frame_embeddings]
+                    
+                    # positionally embed the per_frame_embeddings
+                    action_cls_tokens = [action_model(ami) for ami in action_model_input]
                     
                     z = predictor(z, h, masks_enc, masks_pred, action_cls_tokens)
                     return z
@@ -502,8 +611,12 @@ def main(args, resume_preempt=False):
                 # Step 1. Forward
                 loss_jepa, loss_reg = 0., 0.
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                    h, action_cls_tokens = forward_target(clips, text_embeddings)
-                    z = forward_context(clips, action_cls_tokens)
+                    h, action_cls_tokens = forward_target(clips)
+                    # set p to the duration
+                    p = num_frames // 2
+                    # expand p to the batch size
+                    p = [p] * batch_size
+                    z = forward_context(clips, text_embeddings, p)
                     loss_jepa = loss_fn(z, h)  # jepa prediction loss
                     pstd_z = reg_fn(z)  # predictor variance across patches
                     loss_reg += torch.mean(F.relu(1.-pstd_z))
@@ -628,6 +741,27 @@ def main(args, resume_preempt=False):
 
         # -- Save Checkpoint
         logger.info('avg. loss %.3f' % loss_meter.avg)
+        
+        if rank == 0:  # typically only do full eval on one process
+            eval_loss_avg, eval_loss_jepa_avg, eval_loss_reg_avg = evaluate(
+                encoder, predictor, action_model, target_encoder,
+                eval_loader, device, clip_model, clip_tokenizer,
+                dtype, mixed_precision
+            )
+            # Log to console
+            logger.info(
+                f"[Eval @ epoch {epoch+1}] "
+                f"eval_loss: {eval_loss_avg:.3f}, "
+                f"eval_jepa: {eval_loss_jepa_avg:.3f}, "
+                f"eval_reg: {eval_loss_reg_avg:.3f}"
+            )
+            # Log to eval CSV
+            eval_csv_logger.log(
+                epoch + 1,
+                eval_loss_avg,
+                eval_loss_jepa_avg,
+                eval_loss_reg_avg
+            )
         # -- Save Last
         if epoch % checkpoint_freq == 0 or epoch == (num_epochs - 1):
             save_checkpoint(epoch + 1, latest_path)

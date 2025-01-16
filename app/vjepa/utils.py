@@ -230,6 +230,7 @@ def init_opt(
     encoder,
     predictor,
     action_model,
+    token_learner,
     iterations_per_epoch,
     start_lr,
     ref_lr,
@@ -269,6 +270,15 @@ def init_opt(
             'weight_decay': 0,
         },
     ]
+    if token_learner is not None:
+        param_groups += [
+            {
+                'params': (p for n, p in token_learner.named_parameters()
+                            if ('bias' in n) or (len(p.shape) == 1)),
+                'WD_exclude': zero_init_bias_wd,
+                'weight_decay': 0,
+            }
+        ]
 
     logger.info('Using AdamW')
     optimizer = torch.optim.AdamW(param_groups, betas=betas, eps=eps)

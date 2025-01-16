@@ -66,6 +66,53 @@ torch.backends.cudnn.benchmark = True
 logger = get_logger(__name__)
 
 
+class TokenLearner(nn.Module):
+    """
+    A minimal Token Learner module:
+      - input shape: B x N x D   (B=batch, N=#tokens, D=dim)
+      - output shape: B x K x D  (K < N, i.e., fewer learned tokens)
+    """
+    def __init__(self, embed_dim, num_output_tokens=8):
+        super(TokenLearner, self).__init__()
+        self.num_output_tokens = num_output_tokens
+        
+        # Example: 1D conv-based projection to get 'attention' over tokens
+        # (You can replace this with MLP or other parametric forms as you wish)
+        self.attn_conv = nn.Sequential(
+            nn.Conv1d(in_channels=embed_dim,
+                      out_channels=embed_dim // 4,
+                      kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(in_channels=embed_dim // 4,
+                      out_channels=num_output_tokens,
+                      kernel_size=1)
+        )
+
+    def forward(self, x):
+        """
+        Args:
+          x: B x N x D
+        Returns:
+          out: B x K x D
+        """
+        B, N, D = x.shape
+        # We apply the conv along the token dimension, so transpose to B x D x N
+        x_t = x.transpose(1, 2)  # now B x D x N
+
+        # attn_map: B x K x N (K = num_output_tokens)
+        attn_map = self.attn_conv(x_t)       # shape (B, K, N)
+        attn_map = attn_map.softmax(dim=-1)  # softmax over the token dimension
+
+        # Weighted sum over tokens:
+        #   - x_t is (B, D, N)
+        #   - attn_map is (B, K, N)
+        # We want out to be (B, K, D).
+        # "einops" or manual matmul:
+        out = torch.einsum("bdn,bkn->bkd", x_t, attn_map)
+        
+        return out
+
+
 def main(args, resume_preempt=False):
     # ----------------------------------------------------------------------- #
     #  PASSED IN PARAMS FROM CONFIG FILE
@@ -239,6 +286,17 @@ def main(args, resume_preempt=False):
         action_transformer=True,
     )
     target_encoder = copy.deepcopy(encoder)
+    
+    # right after you initialize predictor, action_model, etc.
+
+    # Suppose we want 8 tokens out from each frame's set of tokens
+    num_output_tokens = 8
+    token_learner = TokenLearner(embed_dim=action_dim,  # or whatever dimension your tokens have
+                                num_output_tokens=num_output_tokens).to(device)
+
+    # Optionally wrap it in DistributedDataParallel if you want
+    token_learner = DistributedDataParallel(token_learner)
+    
 
     # -- make data transforms
     if mask_type == 'multiblock3d':
@@ -331,6 +389,7 @@ def main(args, resume_preempt=False):
         encoder=encoder,
         predictor=predictor,
         action_model=action_model,
+        token_learner=token_learner,
         wd=wd,
         final_wd=final_wd,
         start_lr=start_lr,
@@ -346,6 +405,7 @@ def main(args, resume_preempt=False):
     encoder = DistributedDataParallel(encoder, static_graph=True)
     predictor = DistributedDataParallel(predictor, static_graph=True)
     action_model = DistributedDataParallel(action_model, static_graph=True)
+    token_learner = DistributedDataParallel(token_learner, static_graph=True)
     target_encoder = DistributedDataParallel(target_encoder)
     for p in target_encoder.parameters():
         p.requires_grad = False
@@ -354,6 +414,8 @@ def main(args, resume_preempt=False):
     for p in predictor.parameters():
         p.requires_grad = True
     for p in action_model.parameters():
+        p.requires_grad = True
+    for p in token_learner.parameters():
         p.requires_grad = True
         
         
@@ -597,17 +659,49 @@ def main(args, resume_preempt=False):
                     """
                     Returns list of tensors of shape [B, N, D], one for each mask-pred.
                     """
-                    z = encoder(c, masks_enc)  # [B, N_z, D]
-                    
-                    # pool each patch by the frame it corresponds to 
-                    per_frame_embeddings = [seq.reshape(seq.size(0), pi, seq.size(1) // pi, seq.size(-1)) for seq, pi in zip(z, p)]
-                    per_frame_embeddings = [pfe.mean(dim=2) for pfe in per_frame_embeddings]  # [B, num_frames, D]
+                    z = encoder(c, masks_enc)   # [B, N_z, D]
+
+                    per_frame_embeddings = [
+                        seq.reshape(seq.size(0), pi, seq.size(1)//pi, seq.size(-1)) 
+                        for seq, pi in zip(z, p)
+                    ]
+                    # Instead of pfe.mean(dim=2), apply Token Learner to each [B, (N_z/frames), D].
+                    # But note that each pfe is shape: B x #frames x #patches_per_frame x D
+                    # or B x (#tokens) x D, depending on how you chunk it.
+
+                    per_frame_embeddings = []
+                    for seq, pi in zip(z, p):
+                        # shape is [B, N, D] if each frame is flattened in time dimension
+                        # or [B, pi, (N/pi), D] if you truly separated frames
+                        # For example, if we do the same reshape approach:
+                        reshaped = seq.reshape(
+                            seq.size(0),  # B
+                            pi,           # frames
+                            seq.size(1) // pi,  
+                            seq.size(-1)
+                        )  # => B x frames x (tokens_per_frame) x D
+                        
+                        # Suppose you just want to flatten frames x tokens_per_frame => total tokens
+                        # shape => B x (frames * tokens_per_frame) x D
+                        reshaped = reshaped.view(reshaped.size(0),
+                                                reshaped.size(1) * reshaped.size(2),
+                                                reshaped.size(3))
+                        
+                        # Now pass through TokenLearner to get B x K x D
+                        learned_tokens = token_learner(reshaped)
+                        
+                        # You can keep it as is and feed into the action model,
+                        # or you might do something else, e.g. optionally add a final pooling
+                        # or classification token. For now, let's just store:
+                        per_frame_embeddings.append(learned_tokens)
+
                     # concat text embeddings with per_frame_embeddings
-                    action_model_input = [torch.cat([text_embeddings.repeat(1, 1, 2), pfe], dim=1) for pfe in per_frame_embeddings]
-                    
-                    # positionally embed the per_frame_embeddings
+                    action_model_input = [
+                        torch.cat([text_embeddings.repeat(1, 1, 2), pfe], dim=1) 
+                        for pfe in per_frame_embeddings
+                    ]
                     action_cls_tokens = [action_model(ami) for ami in action_model_input]
-                    
+
                     z = predictor(z, h, masks_enc, masks_pred, action_cls_tokens)
                     return z
 
