@@ -429,7 +429,7 @@ def main(args, resume_preempt=False):
             eval_reg_meter = AverageMeter()
 
             with torch.no_grad():
-                for batch_idx, (udata, masks_enc, masks_pred, p) in enumerate(data_loader):
+                for batch_idx, (udata, masks_enc, masks_pred) in enumerate(data_loader):
                     # Move data to GPU
                     clips = torch.cat([u.to(device, non_blocking=True) for u in udata[0]], dim=0)
                     labels = udata[1]
@@ -459,6 +459,10 @@ def main(args, resume_preempt=False):
 
                         # context encoding
                         z_splits = encoder(clips, _masks_enc)
+                        
+                        p = num_frames // 2
+                        # expand p to the batch size
+                        p = [p] * batch_size
 
                         # apply action model
                         per_frame_embeddings = [

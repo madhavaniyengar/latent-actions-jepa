@@ -68,16 +68,13 @@ logger = get_logger(__name__)
 
 class TokenLearner(nn.Module):
     """
-    A minimal Token Learner module:
+    Token Learner module:
       - input shape: B x N x D   (B=batch, N=#tokens, D=dim)
       - output shape: B x K x D  (K < N, i.e., fewer learned tokens)
     """
     def __init__(self, embed_dim, num_output_tokens=8):
         super(TokenLearner, self).__init__()
         self.num_output_tokens = num_output_tokens
-        
-        # Example: 1D conv-based projection to get 'attention' over tokens
-        # (You can replace this with MLP or other parametric forms as you wish)
         self.attn_conv = nn.Sequential(
             nn.Conv1d(in_channels=embed_dim,
                       out_channels=embed_dim // 4,

@@ -1,7 +1,10 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+#
+
 import os
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
@@ -11,6 +14,7 @@ try:
     # --          THAT YOUR JOBS ARE LAUNCHED WITH ONLY 1 DEVICE VISIBLE
     # --          TO EACH PROCESS
     os.environ['CUDA_VISIBLE_DEVICES'] = os.environ['SLURM_LOCALID']
+
 except Exception:
     pass
 
@@ -46,6 +50,8 @@ from app.vjepa.utils import (
 )
 from app.vjepa.transforms import make_transforms
 from transformers import CLIPTokenizer, CLIPTextModel
+
+# --
 log_timings = True
 log_freq = 10
 checkpoint_freq = 1
@@ -58,121 +64,6 @@ torch.backends.cudnn.benchmark = True
 
 
 logger = get_logger(__name__)
-# Define the conditional diffusion model (U-Net architecture)
-class ConditionalUNet(nn.Module):
-    def __init__(self, image_channels=3, cond_channels=768, time_embed_dim=256):
-        super(ConditionalUNet, self).__init__()
-        self.image_channels = image_channels
-        self.cond_channels = cond_channels
-        self.time_embed_dim = time_embed_dim
-
-        # Time embedding
-        self.time_embed = nn.Sequential(
-            nn.Embedding(1000, time_embed_dim),
-            nn.Linear(time_embed_dim, time_embed_dim),
-            nn.ReLU(),
-            nn.Linear(time_embed_dim, time_embed_dim),
-        )
-
-        # Conditioning embedding
-        self.cond_embed = nn.Sequential(
-            nn.Linear(cond_channels, time_embed_dim),
-            nn.ReLU(),
-            nn.Linear(time_embed_dim, time_embed_dim),
-        )
-
-        # U-Net architecture
-        self.encoder = nn.Sequential(
-            nn.Conv2d(image_channels, 64, kernel_size=3, stride=1, padding=1),  # 64 x H x W
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),  # 128 x H/2 x W/2
-            nn.ReLU(),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),  # 256 x H/4 x W/4
-            nn.ReLU(),
-        )
-
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(256 + time_embed_dim + time_embed_dim, 128, kernel_size=4, stride=2, padding=1),  # 128 x H/2 x W/2
-            nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),  # 64 x H x W
-            nn.ReLU(),
-            nn.Conv2d(64, image_channels, kernel_size=3, stride=1, padding=1),  # image_channels x H x W
-        )
-
-    def forward(self, x, t, cond):
-        # x: [B, C, H, W]
-        # t: [B]
-        # cond: [B, cond_channels]
-        B = x.size(0)
-
-        # Embed time step t
-        t_embed = self.time_embed(t)  # [B, time_embed_dim]
-
-        # Embed conditioning information
-        cond_embed = self.cond_embed(cond)  # [B, time_embed_dim]
-
-        # Encode image
-        h = self.encoder(x)  # [B, 256, H/4, W/4]
-
-        # Expand embeddings to match spatial dimensions
-        t_embed = t_embed.view(B, -1, 1, 1).repeat(1, 1, h.size(2), h.size(3))  # [B, time_embed_dim, H/4, W/4]
-        cond_embed = cond_embed.view(B, -1, 1, 1).repeat(1, 1, h.size(2), h.size(3))  # [B, time_embed_dim, H/4, W/4]
-
-        # Concatenate embeddings with encoded image
-        h = torch.cat([h, t_embed, cond_embed], dim=1)  # [B, 256 + 2 * time_embed_dim, H/4, W/4]
-
-        # Decode to get output image
-        x_recon = self.decoder(h)  # [B, image_channels, H, W]
-
-        return x_recon
-
-# Define the noise schedule and diffusion process
-def get_beta_schedule(timesteps, beta_start=0.0001, beta_end=0.02):
-    return torch.linspace(beta_start, beta_end, timesteps)
-
-def get_alphas(betas):
-    alphas = 1.0 - betas
-    alpha_bar = torch.cumprod(alphas, dim=0)
-    return alphas, alpha_bar
-
-def forward_diffusion_sample(x_0, t, alpha_bar_sqrt, one_minus_alpha_bar_sqrt):
-    noise = torch.randn_like(x_0)
-    x_t = alpha_bar_sqrt[t].view(-1, 1, 1, 1) * x_0 + one_minus_alpha_bar_sqrt[t].view(-1, 1, 1, 1) * noise
-    return x_t, noise
-
-# Training loop
-def train_diffusion_model(model, dataloader, optimizer, epochs, device, timesteps):
-    betas = get_beta_schedule(timesteps)
-    alphas, alpha_bars = get_alphas(betas)
-    alpha_bar_sqrt = torch.sqrt(alpha_bars).to(device)
-    one_minus_alpha_bar_sqrt = torch.sqrt(1 - alpha_bars).to(device)
-
-    for epoch in range(epochs):
-        model.train()
-        for batch in dataloader:
-            x_0 = batch['images'].to(device)  # Original images
-            cond = batch['video_embeddings'].to(device)  # Video embeddings from frozen V-JEPA
-
-            B = x_0.size(0)
-
-            # Sample random time steps for each image in the batch
-            t = torch.randint(0, timesteps, (B,), device=device).long()
-
-            # Generate noisy images and the noise used
-            x_t, noise = forward_diffusion_sample(x_0, t, alpha_bar_sqrt, one_minus_alpha_bar_sqrt)
-
-            # Predict the noise using the model
-            noise_pred = model(x_t, t, cond)
-
-            # Compute loss between the predicted noise and the actual noise
-            loss = F.mse_loss(noise_pred, noise)
-
-            # Backpropagation and optimization step
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item()}")
 
 
 def main(args, resume_preempt=False):
@@ -219,6 +110,7 @@ def main(args, resume_preempt=False):
     dataset_type = cfgs_data.get('dataset_type', 'videodataset')
     mask_type = cfgs_data.get('mask_type', 'multiblock3d')
     dataset_paths = cfgs_data.get('datasets', [])
+    eval_dataset_paths = cfgs_data.get('eval_datasets', None)
     datasets_weights = cfgs_data.get('datasets_weights', None)
     if datasets_weights is not None:
         assert len(datasets_weights) == len(dataset_paths), 'Must have one sampling weight specified for each dataset'
@@ -271,19 +163,7 @@ def main(args, resume_preempt=False):
     tag = cfgs_logging.get('write_tag')
 
     # ----------------------------------------------------------------------- #
-    # ----------------------------------------------------------------------- #    # Initialize the diffusion model
-    h_dim = pred_embed_dim  # Assuming pred_embed_dim is the dimension of h
-    diffusion_model = ConditionalUNet(image_channels=3, cond_channels=h_dim).to(device)
-    diffusion_model = DistributedDataParallel(diffusion_model, device_ids=[device.index])
-    diffusion_optimizer = optim.Adam(diffusion_model.parameters(), lr=1e-4)
-    diffusion_scaler = torch.cuda.amp.GradScaler(enabled=mixed_precision)
-
-    # Precompute betas, alphas for the diffusion process
-    timesteps = 1000
-    betas = get_beta_schedule(timesteps)
-    alphas, alpha_bars = get_alphas(betas)
-    alpha_bar_sqrt = torch.sqrt(alpha_bars).to(device)
-    one_minus_alpha_bar_sqrt = torch.sqrt(1 - alpha_bars).to(device)
+    # ----------------------------------------------------------------------- #
 
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -328,6 +208,15 @@ def main(args, resume_preempt=False):
         ('%d', 'gpu-time(ms)'),
         ('%d', 'wall-time(ms)'),
     )
+    
+    eval_log_file = os.path.join(folder, f'{tag}_eval_r{rank}.csv')
+    eval_csv_logger = CSVLogger(
+        eval_log_file,
+        ('%d', 'epoch'),
+        ('%.5f', 'eval_loss'),
+        ('%.5f', 'eval_loss_jepa'),
+        ('%.5f', 'eval_loss_reg'),
+    )
 
     # -- init model
     encoder, predictor, action_model = init_video_model(
@@ -349,7 +238,7 @@ def main(args, resume_preempt=False):
         clip_embed_dim=512,
         action_transformer=True,
     )
-
+    target_encoder = copy.deepcopy(encoder)
 
     # -- make data transforms
     if mask_type == 'multiblock3d':
@@ -413,6 +302,29 @@ def main(args, resume_preempt=False):
     if ipe is None:
         ipe = _dlen
     logger.info(f'iterations per epoch/dataest length: {ipe}/{_dlen}')
+    
+    eval_batch_size = 4  # for instance, use a smaller batch
+    (eval_loader,
+     eval_sampler) = init_data(
+         data=dataset_type,
+         root_path=eval_dataset_paths,
+         batch_size=eval_batch_size,
+         training=False,  # disable random sampling, shuffling, etc.
+         clip_len=num_frames,
+         frame_sample_rate=sampling_rate,
+         filter_short_videos=filter_short_videos,
+         decode_one_clip=decode_one_clip,
+         duration=duration,
+         num_clips=num_clips,
+         transform=transform,
+         datasets_weights=None,  # usually not needed for evaluation
+         collator=mask_collator,
+         num_workers=0,
+         world_size=1,    # often just evaluate on a single GPU
+         pin_mem=False,
+         rank=0,
+         log_dir=None
+    )
 
     # -- init optimizer and scheduler
     optimizer, scaler, scheduler, wd_scheduler = init_opt(
@@ -434,12 +346,15 @@ def main(args, resume_preempt=False):
     encoder = DistributedDataParallel(encoder, static_graph=True)
     predictor = DistributedDataParallel(predictor, static_graph=True)
     action_model = DistributedDataParallel(action_model, static_graph=True)
+    target_encoder = DistributedDataParallel(target_encoder)
+    for p in target_encoder.parameters():
+        p.requires_grad = False
     for p in encoder.parameters():
-        p.requires_grad = False
+        p.requires_grad = True
     for p in predictor.parameters():
-        p.requires_grad = False
+        p.requires_grad = True
     for p in action_model.parameters():
-        p.requires_grad = False
+        p.requires_grad = True
         
         
     clip_model = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
@@ -473,8 +388,32 @@ def main(args, resume_preempt=False):
             next(momentum_scheduler)
             mask_collator.step()
 
+    def save_checkpoint(epoch, path):
+        if rank != 0:
+            return
+        save_dict = {
+            'encoder': encoder.state_dict(),
+            'predictor': predictor.state_dict(),
+            'action_model': action_model.state_dict(),
+            'opt': optimizer.state_dict(),
+            'scaler': None if scaler is None else scaler.state_dict(),
+            'target_encoder': target_encoder.state_dict(),
+            'epoch': epoch,
+            'loss': loss_meter.avg,
+            'batch_size': batch_size,
+            'world_size': world_size,
+            'lr': lr,
+        }
+        try:
+            torch.save(save_dict, path)
+        except Exception as e:
+            logger.info(f'Encountered exception when saving checkpoint: {e}')
+            
+    
+
     logger.info('Initializing loader...')
-    loader = iter(unsupervised_loader)
+    
+    logger.info(f'len unsupervised loader, {len(unsupervised_loader)}')
 
     if skip_batches > 0:
         logger.info(f'Skip {skip_batches} batches')
@@ -487,7 +426,7 @@ def main(args, resume_preempt=False):
             except Exception:
                 loader = iter(unsupervised_loader)
                 udata = next(loader)
-
+    
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
         logger.info('Epoch %d' % (epoch + 1))
@@ -496,10 +435,16 @@ def main(args, resume_preempt=False):
         unsupervised_sampler.set_epoch(epoch)
 
         loss_meter = AverageMeter()
-        diffusion_loss_meter = AverageMeter()
+        input_var_meter = AverageMeter()
+        input_var_min_meter = AverageMeter()
+        jepa_loss_meter = AverageMeter()
+        reg_loss_meter = AverageMeter()
         mask_meters = [AverageMeter() for _ in range(len(cfgs_mask))]
+        gpu_time_meter = AverageMeter()
+        wall_time_meter = AverageMeter()
 
         for itr in range(ipe):
+            print('epoch', epoch, 'itr', itr)
             itr_start_time = time.time()
 
             try:
@@ -545,84 +490,209 @@ def main(args, resume_preempt=False):
             for _i, m in enumerate(mask_meters):
                 m.update(masks_enc[_i][0].size(-1))
 
-            def forward_pass():
+            def train_step():
+                _new_lr = scheduler.step()
+                _new_wd = wd_scheduler.step()
+                # --
+
                 def forward_target(c):
                     """
-                    Returns tensor h of shape [B, N, D], where B is batch size,
-                    N is number of tokens, D is embedding dimension.
+                    Returns list of tensors of shape [B, N, D], one for each
+                    mask-pred.
                     """
                     with torch.no_grad():
                         h = target_encoder(c)
                         h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim  [B, N, D]
                         # -- create targets (masked regions of h)
                         h = apply_masks(h, masks_pred, concat=False)
-                        h = h[0]  # Assuming single mask for simplicity
                         return h
 
+
+                def forward_context(c, text_embeddings, p):
+                    """
+                    Returns list of tensors of shape [B, N, D], one for each mask-pred.
+                    """
+                    z = encoder(c, masks_enc)  # [B, N_z, D]
+                    
+                    # pool each patch by the frame it corresponds to 
+                    per_frame_embeddings = [seq.reshape(seq.size(0), pi, seq.size(1) // pi, seq.size(-1)) for seq, pi in zip(z, p)]
+                    per_frame_embeddings = [pfe.mean(dim=2) for pfe in per_frame_embeddings]  # [B, num_frames, D]
+                    # concat text embeddings with per_frame_embeddings
+                    action_model_input = [torch.cat([text_embeddings.repeat(1, 1, 2), pfe], dim=1) for pfe in per_frame_embeddings]
+                    
+                    # positionally embed the per_frame_embeddings
+                    action_cls_tokens = [action_model(ami) for ami in action_model_input]
+                    
+                    z = predictor(z, h, masks_enc, masks_pred, action_cls_tokens)
+                    return z
+
+                def loss_fn(z, h):
+                    loss = 0.
+                    # Compute loss and accumulate for each mask-enc/mask-pred pair
+                    for zi, hi in zip(z, h):
+                        loss += torch.mean(torch.abs(zi - hi)**loss_exp) / loss_exp
+                    loss /= len(masks_pred)
+                    return loss
+
+                def reg_fn(z):
+                    return sum([torch.sqrt(zi.var(dim=1) + 0.0001) for zi in z]) / len(z)
+
                 # Step 1. Forward
+                loss_jepa, loss_reg = 0., 0.
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                    h = forward_target(clips)  # h: [B, N, D]
+                    h = forward_target(clips)
+                    z = forward_context(clips, text_embeddings, p)
+                    loss_jepa = loss_fn(z, h)  # jepa prediction loss
+                    pstd_z = reg_fn(z)  # predictor variance across patches
+                    loss_reg += torch.mean(F.relu(1.-pstd_z))
+                loss = loss_jepa + reg_coeff * loss_reg
 
-                    # Extract frames from clips
-                    B, C, num_frames, H, W = clips.shape
-                    x_0 = clips.permute(0, 2, 1, 3, 4).reshape(B * num_frames, C, H, W)  # [B*num_frames, C, H, W]
+                # Step 2. Backward & step
+                _enc_norm, _pred_norm = 0., 0.
+                if mixed_precision:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
+                if (epoch > warmup) and (clip_grad is not None):
+                    _enc_norm = torch.nn.utils.clip_grad_norm_(encoder.parameters(), clip_grad)
+                    _pred_norm = torch.nn.utils.clip_grad_norm_(predictor.parameters(), clip_grad)
+                if mixed_precision:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                grad_stats = grad_logger(encoder.named_parameters())
+                grad_stats.global_norm = float(_enc_norm)
+                grad_stats_pred = grad_logger(predictor.named_parameters())
+                grad_stats_pred.global_norm = float(_pred_norm)
+                optimizer.zero_grad()
+                optim_stats = adamw_logger(optimizer)
 
-                    # Prepare conditioning embeddings
-                    h_pooled = h.mean(dim=1)  # [B, D]
-                    cond = h_pooled.unsqueeze(1).repeat(1, num_frames, 1).reshape(B * num_frames, -1)  # [B*num_frames, D]
+                # Step 3. momentum update of target encoder
+                m = next(momentum_scheduler)
+                with torch.no_grad():
+                    for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
+                        param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
 
-                    # Sample random time steps for each image in the batch
-                    t = torch.randint(0, timesteps, (B * num_frames,), device=device).long()
+                return (
+                    float(loss),
+                    float(loss_jepa),
+                    float(loss_reg),
+                    _new_lr,
+                    _new_wd,
+                    grad_stats,
+                    grad_stats_pred,
+                    optim_stats,
+                )
+            (loss, loss_jepa, loss_reg, _new_lr, _new_wd, grad_stats, grad_stats_pred, optim_stats,), gpu_etime_ms = gpu_timer(train_step)
+            iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.
+            loss_meter.update(loss)
+            input_var = float(AllReduce.apply(clips.view(clips.shape[0], -1).var(dim=1).mean(dim=0)))
+            input_var_min = float(AllReduce.apply(torch.min(clips.view(clips.shape[0], -1).var(dim=1))))
+            input_var_meter.update(input_var)
+            input_var_min_meter.update(input_var_min)
+            jepa_loss_meter.update(loss_jepa)
+            reg_loss_meter.update(loss_reg)
+            gpu_time_meter.update(gpu_etime_ms)
+            wall_time_meter.update(iter_elapsed_time_ms)
 
-                    # Generate noisy images and the noise used
-                    x_t, noise = forward_diffusion_sample(x_0, t, alpha_bar_sqrt, one_minus_alpha_bar_sqrt)
+            # -- Logging
+            def log_stats():
+                csv_logger.log(
+                    epoch + 1,
+                    itr,
+                    loss,
+                    loss_jepa,
+                    loss_reg,
+                    grad_stats.global_norm,
+                    grad_stats_pred.global_norm,
+                    gpu_etime_ms,
+                    iter_elapsed_time_ms)
+                if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
+                    logger.info(
+                        '[%d, %5d] loss: %.3f | p%.3f r%.3f | '
+                        'input_var: %.3f %.3f | '
+                        'masks: %s '
+                        '[wd: %.2e] [lr: %.2e] '
+                        '[mem: %.2e] '
+                        '[gpu: %.1f ms]'
+                        '[wall: %.1f ms]'
+                        % (epoch + 1, itr,
+                           loss_meter.avg,
+                           jepa_loss_meter.avg,
+                           reg_loss_meter.avg,
+                           input_var_meter.avg,
+                           input_var_min_meter.avg,
+                           '[' + ', '.join(['%.1f' % m.avg for m in mask_meters]) + ']',
+                           _new_wd,
+                           _new_lr,
+                           torch.cuda.max_memory_allocated() / 1024.0**2,
+                           gpu_time_meter.avg,
+                           wall_time_meter.avg))
 
-                    # Predict the noise using the diffusion model
-                    noise_pred = diffusion_model(x_t, t, cond)
+                    if optim_stats is not None:
+                        logger.info(
+                            '[%d, %5d] first moment: %.2e [%.2e %.2e] second moment: %.2e [%.2e %.2e]'
+                            % (epoch + 1, itr,
+                               optim_stats.get('exp_avg').avg,
+                               optim_stats.get('exp_avg').min,
+                               optim_stats.get('exp_avg').max,
+                               optim_stats.get('exp_avg_sq').avg,
+                               optim_stats.get('exp_avg_sq').min,
+                               optim_stats.get('exp_avg_sq').max))
 
-                    # Compute loss between the predicted noise and the actual noise
-                    diffusion_loss = F.mse_loss(noise_pred, noise)
+                    if grad_stats is not None:
+                        logger.info(
+                            '[%d, %5d] enc_grad_stats: f/l[%.2e %.2e] mn/mx(%.2e, %.2e) %.2e'
+                            % (epoch + 1, itr,
+                               grad_stats.first_layer,
+                               grad_stats.last_layer,
+                               grad_stats.min,
+                               grad_stats.max,
+                               grad_stats.global_norm))
 
-                # Backpropagation and optimization step
-                diffusion_optimizer.zero_grad()
-                diffusion_scaler.scale(diffusion_loss).backward()
-                diffusion_scaler.step(diffusion_optimizer)
-                diffusion_scaler.update()
+                    if grad_stats_pred is not None:
+                        logger.info(
+                            '[%d, %5d] pred_grad_stats: f/l[%.2e %.2e] mn/mx(%.2e, %.2e) %.2e'
+                            % (epoch + 1, itr,
+                               grad_stats_pred.first_layer,
+                               grad_stats_pred.last_layer,
+                               grad_stats_pred.min,
+                               grad_stats_pred.max,
+                               grad_stats_pred.global_norm))
+            log_stats()
+            assert not np.isnan(loss), 'loss is nan'
 
-                return diffusion_loss.item()
+        # -- Save Checkpoint
+        logger.info('avg. loss %.3f' % loss_meter.avg)
         
-            diffusion_loss = forward_pass()
-            diffusion_loss_meter.update(diffusion_loss)
-            
-            if itr % log_freq == 0 and rank == 0:
-                            logger.info(f'Epoch [{epoch + 1}/{num_epochs}], Iteration [{itr + 1}/{ipe}], '
-                                        f'Diffusion Loss: {diffusion_loss_meter.avg:.5f}')
-
-        # Save checkpoint
-        if rank == 0 and (epoch + 1) % checkpoint_freq == 0:
-            checkpoint = {
-                'epoch': epoch + 1,
-                'diffusion_model_state_dict': diffusion_model.state_dict(),
-                'diffusion_optimizer_state_dict': diffusion_optimizer.state_dict(),
-                'diffusion_scaler_state_dict': diffusion_scaler.state_dict(),
-            }
-            torch.save(checkpoint, os.path.join(folder, f'diffusion_model_epoch_{epoch + 1}.pth.tar'))
-
-
-
-
-# Usage example:
-# Assume you have a DataLoader 'dataloader' that provides batches with 'images' and 'video_embeddings'
-# 'vjepa_model' is your frozen V-JEPA model used to generate 'video_embeddings'
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-timesteps = 1000  # Number of diffusion steps
-
-# Initialize the conditional diffusion model
-model = ConditionalUNet(image_channels=3, cond_channels=768).to(device)
-
-# Set up the optimizer
-optimizer = optim.Adam(model.parameters(), lr=1e-4)
-
-# Train the diffusion model
-train_diffusion_model(model, dataloader, optimizer, epochs=10, device=device, timesteps=timesteps)
+        
+        if rank == 0:  # typically only do full eval on one process
+            eval_loss_avg, eval_loss_jepa_avg, eval_loss_reg_avg = evaluate(
+                encoder, predictor, action_model, target_encoder,
+                eval_loader, device, clip_model, clip_tokenizer,
+                dtype, mixed_precision
+            )
+            # Log to console
+            logger.info(
+                f"[Eval @ epoch {epoch+1}] "
+                f"eval_loss: {eval_loss_avg:.3f}, "
+                f"eval_jepa: {eval_loss_jepa_avg:.3f}, "
+                f"eval_reg: {eval_loss_reg_avg:.3f}"
+            )
+            # Log to eval CSV
+            eval_csv_logger.log(
+                epoch + 1,
+                eval_loss_avg,
+                eval_loss_jepa_avg,
+                eval_loss_reg_avg
+            )
+        
+        # -- Save Last
+        if epoch % checkpoint_freq == 0 or epoch == (num_epochs - 1):
+            save_checkpoint(epoch + 1, latest_path)
+            if save_every_freq > 0 and epoch % save_every_freq == 0:
+                save_every_file = f'{tag}-e{epoch}.pth.tar'
+                save_every_path = os.path.join(folder, save_every_file)
+                save_checkpoint(epoch + 1, save_every_path)
