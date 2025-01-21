@@ -1,0 +1,181 @@
+[INFO] Using dtype=torch.bfloat16 (mixed_precision=True)
+/home/madhavan/miniconda3/envs/jepa/lib/python3.9/site-packages/torch/nn/modules/transformer.py:379: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.self_attn.batch_first was not True(use batch_first for better inference performance)
+  warnings.warn(
+[INFO    ][2025-01-21 14:41:36][init_video_model         ] MultiMaskWrapper(
+  (backbone): VisionTransformer(
+    (patch_embed): PatchEmbed3D(
+      (proj): Conv3d(3, 1024, kernel_size=(2, 16, 16), stride=(2, 16, 16))
+    )
+    (blocks): ModuleList(
+      (0-23): 24 x Block(
+        (norm1): LayerNorm((1024,), eps=1e-06, elementwise_affine=True)
+        (attn): Attention(
+          (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+          (attn_drop): Dropout(p=0.0, inplace=False)
+          (proj): Linear(in_features=1024, out_features=1024, bias=True)
+          (proj_drop): Dropout(p=0.0, inplace=False)
+        )
+        (norm2): LayerNorm((1024,), eps=1e-06, elementwise_affine=True)
+        (mlp): MLP(
+          (fc1): Linear(in_features=1024, out_features=4096, bias=True)
+          (act): GELU(approximate='none')
+          (fc2): Linear(in_features=4096, out_features=1024, bias=True)
+          (drop): Dropout(p=0.0, inplace=False)
+        )
+      )
+    )
+    (norm): LayerNorm((1024,), eps=1e-06, elementwise_affine=True)
+  )
+)
+[INFO    ][2025-01-21 14:41:36][init_video_model         ] PredictorMultiMaskWrapper(
+  (backbone): VisionTransformerPredictor(
+    (predictor_embed): Linear(in_features=1024, out_features=384, bias=True)
+    (mask_tokens): ParameterList(
+        (0): Parameter containing: [torch.float32 of size 1x1x384 (cuda:0)]
+        (1): Parameter containing: [torch.float32 of size 1x1x384 (cuda:0)]
+    )
+    (predictor_blocks): ModuleList(
+      (0-11): 12 x Block(
+        (norm1): LayerNorm((384,), eps=1e-06, elementwise_affine=True)
+        (attn): Attention(
+          (qkv): Linear(in_features=384, out_features=1152, bias=True)
+          (attn_drop): Dropout(p=0.0, inplace=False)
+          (proj): Linear(in_features=384, out_features=384, bias=True)
+          (proj_drop): Dropout(p=0.0, inplace=False)
+        )
+        (norm2): LayerNorm((384,), eps=1e-06, elementwise_affine=True)
+        (mlp): MLP(
+          (fc1): Linear(in_features=384, out_features=1536, bias=True)
+          (act): GELU(approximate='none')
+          (fc2): Linear(in_features=1536, out_features=384, bias=True)
+          (drop): Dropout(p=0.0, inplace=False)
+        )
+      )
+    )
+    (predictor_norm): LayerNorm((384,), eps=1e-06, elementwise_affine=True)
+    (predictor_proj): Linear(in_features=384, out_features=1024, bias=True)
+  )
+)
+[INFO    ][2025-01-21 14:41:36][init_video_model         ] ActionTransformer(
+  (pos_encoder): PositionalEncoding(
+    (dropout): Dropout(p=0.1, inplace=False)
+  )
+  (transformer_encoder): TransformerEncoder(
+    (layers): ModuleList(
+      (0-1): 2 x TransformerEncoderLayer(
+        (self_attn): MultiheadAttention(
+          (out_proj): NonDynamicallyQuantizableLinear(in_features=1024, out_features=1024, bias=True)
+        )
+        (linear1): Linear(in_features=1024, out_features=2048, bias=True)
+        (dropout): Dropout(p=0.1, inplace=False)
+        (linear2): Linear(in_features=2048, out_features=1024, bias=True)
+        (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+        (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+        (dropout1): Dropout(p=0.1, inplace=False)
+        (dropout2): Dropout(p=0.1, inplace=False)
+      )
+    )
+  )
+)
+[INFO    ][2025-01-21 14:41:36][init_video_model         ] Encoder number of parameters: 303885312
+[INFO    ][2025-01-21 14:41:36][init_video_model         ] Predictor number of parameters: 22082944
+[INFO    ][2025-01-21 14:41:36][init_video_model         ] Action MLP number of parameters: 16799744
+[INFO] Initializing basic multi-block mask
+[INFO    ][2025-01-21 14:41:36][make_videodataset        ] VideoDataset dataset created
+[INFO    ][2025-01-21 14:41:36][make_videodataset        ] VideoDataset unsupervised data loader created
+[INFO] Iterations per epoch: ipe=276, dataset length=276
+[INFO    ][2025-01-21 14:41:36][make_videodataset        ] VideoDataset dataset created
+[INFO    ][2025-01-21 14:41:36][make_videodataset        ] VideoDataset unsupervised data loader created
+[INFO    ][2025-01-21 14:41:36][init_opt                 ] Using AdamW
+/home/madhavan/jepa/app/vjepa/utils.py:299: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
+/home/madhavan/jepa/app/vjepa/utils.py:79: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  checkpoint = torch.load(r_path, map_location=torch.device('cpu'))
+[INFO    ][2025-01-21 14:41:39][load_checkpoint          ] loaded pretrained encoder from epoch 300 with msg: <All keys matched successfully>
+[INFO    ][2025-01-21 14:41:39][load_checkpoint          ] Encountered exception when loading checkpoint Error(s) in loading state_dict for DistributedDataParallel:
+	Missing key(s) in state_dict: "module.backbone.action_pos_embed".
+[INFO] Initializing loader...
+[INFO] Unsupervised loader length = 276
+[INFO] Starting epoch 1/400
+/home/madhavan/jepa/app/vjepa/train_combined.py:654: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+/home/madhavan/miniconda3/envs/jepa/lib/python3.9/contextlib.py:87: FutureWarning: `torch.backends.cuda.sdp_kernel()` is deprecated. In the future, this context manager will be removed. Please see `torch.nn.attention.sdpa_kernel()` for the new context manager, with updated signature.
+  self.gen = func(*args, **kwds)
+[Epoch 1, Iter 0/276] loss: 0.897 | jepa: 0.897, reg: 0.723 | input_var: 1.156, min: 0.675 | [wd: 4.00e-02, lr: 2.00e-04] | GPU mem: 25311.30MB | gpu_time: 7370.95ms, wall_time: 8227.15ms
+[Epoch 1, Iter 10/276] loss: 0.683 | jepa: 0.683, reg: 0.939 | input_var: 1.250, min: 0.431 | [wd: 4.00e-02, lr: 2.00e-04] | GPU mem: 31899.83MB | gpu_time: 4090.13ms, wall_time: 4798.08ms
+[Epoch 1, Iter 20/276] loss: 0.622 | jepa: 0.622, reg: 0.953 | input_var: 1.236, min: 0.400 | [wd: 4.00e-02, lr: 2.01e-04] | GPU mem: 32997.08MB | gpu_time: 3943.03ms, wall_time: 4649.18ms
+[Epoch 1, Iter 30/276] loss: 0.596 | jepa: 0.596, reg: 0.949 | input_var: 1.229, min: 0.392 | [wd: 4.00e-02, lr: 2.01e-04] | GPU mem: 32997.08MB | gpu_time: 3853.33ms, wall_time: 4552.33ms
+[Epoch 1, Iter 40/276] loss: 0.583 | jepa: 0.583, reg: 0.937 | input_var: 1.235, min: 0.423 | [wd: 4.00e-02, lr: 2.02e-04] | GPU mem: 32997.08MB | gpu_time: 3809.45ms, wall_time: 4500.99ms
+[Epoch 1, Iter 50/276] loss: 0.574 | jepa: 0.574, reg: 0.924 | input_var: 1.239, min: 0.425 | [wd: 4.00e-02, lr: 2.02e-04] | GPU mem: 33384.25MB | gpu_time: 3800.42ms, wall_time: 4486.38ms
+[Epoch 1, Iter 60/276] loss: 0.568 | jepa: 0.568, reg: 0.912 | input_var: 1.240, min: 0.416 | [wd: 4.00e-02, lr: 2.02e-04] | GPU mem: 33384.25MB | gpu_time: 3774.81ms, wall_time: 4462.82ms
+[Epoch 1, Iter 70/276] loss: 0.561 | jepa: 0.561, reg: 0.896 | input_var: 1.241, min: 0.433 | [wd: 4.00e-02, lr: 2.03e-04] | GPU mem: 33384.25MB | gpu_time: 3758.72ms, wall_time: 4442.94ms
+[Epoch 1, Iter 80/276] loss: 0.555 | jepa: 0.555, reg: 0.877 | input_var: 1.243, min: 0.426 | [wd: 4.00e-02, lr: 2.03e-04] | GPU mem: 33384.25MB | gpu_time: 3756.48ms, wall_time: 4438.97ms
+[Epoch 1, Iter 90/276] loss: 0.549 | jepa: 0.549, reg: 0.864 | input_var: 1.236, min: 0.422 | [wd: 4.00e-02, lr: 2.04e-04] | GPU mem: 33607.79MB | gpu_time: 3755.74ms, wall_time: 4437.35ms
+[Epoch 1, Iter 100/276] loss: 0.543 | jepa: 0.543, reg: 0.849 | input_var: 1.234, min: 0.421 | [wd: 4.00e-02, lr: 2.04e-04] | GPU mem: 33607.79MB | gpu_time: 3749.37ms, wall_time: 4429.11ms
+[Epoch 1, Iter 110/276] loss: 0.538 | jepa: 0.538, reg: 0.836 | input_var: 1.238, min: 0.422 | [wd: 4.00e-02, lr: 2.04e-04] | GPU mem: 33607.79MB | gpu_time: 3741.02ms, wall_time: 4418.43ms
+[Epoch 1, Iter 120/276] loss: 0.532 | jepa: 0.532, reg: 0.826 | input_var: 1.242, min: 0.424 | [wd: 4.00e-02, lr: 2.05e-04] | GPU mem: 33607.79MB | gpu_time: 3742.56ms, wall_time: 4420.23ms
+[Epoch 1, Iter 130/276] loss: 0.526 | jepa: 0.526, reg: 0.817 | input_var: 1.237, min: 0.424 | [wd: 4.00e-02, lr: 2.05e-04] | GPU mem: 33607.79MB | gpu_time: 3733.70ms, wall_time: 4411.49ms
+[Epoch 1, Iter 140/276] loss: 0.519 | jepa: 0.519, reg: 0.811 | input_var: 1.237, min: 0.426 | [wd: 4.00e-02, lr: 2.05e-04] | GPU mem: 33607.79MB | gpu_time: 3729.71ms, wall_time: 4407.94ms
+[Epoch 1, Iter 150/276] loss: 0.511 | jepa: 0.511, reg: 0.805 | input_var: 1.237, min: 0.427 | [wd: 4.00e-02, lr: 2.06e-04] | GPU mem: 33607.79MB | gpu_time: 3724.68ms, wall_time: 4404.39ms
+[Epoch 1, Iter 160/276] loss: 0.504 | jepa: 0.504, reg: 0.801 | input_var: 1.235, min: 0.430 | [wd: 4.00e-02, lr: 2.06e-04] | GPU mem: 33607.79MB | gpu_time: 3726.33ms, wall_time: 4405.26ms
+[Epoch 1, Iter 170/276] loss: 0.495 | jepa: 0.495, reg: 0.797 | input_var: 1.234, min: 0.429 | [wd: 4.00e-02, lr: 2.07e-04] | GPU mem: 33607.79MB | gpu_time: 3723.45ms, wall_time: 4402.47ms
+[Epoch 1, Iter 180/276] loss: 0.487 | jepa: 0.487, reg: 0.795 | input_var: 1.232, min: 0.424 | [wd: 4.00e-02, lr: 2.07e-04] | GPU mem: 33607.79MB | gpu_time: 3719.23ms, wall_time: 4397.87ms
+[Epoch 1, Iter 190/276] loss: 0.480 | jepa: 0.480, reg: 0.792 | input_var: 1.234, min: 0.428 | [wd: 4.00e-02, lr: 2.07e-04] | GPU mem: 33607.79MB | gpu_time: 3715.25ms, wall_time: 4394.95ms
+[Epoch 1, Iter 200/276] loss: 0.474 | jepa: 0.474, reg: 0.790 | input_var: 1.235, min: 0.424 | [wd: 4.00e-02, lr: 2.08e-04] | GPU mem: 33607.79MB | gpu_time: 3712.44ms, wall_time: 4391.42ms
+[Epoch 1, Iter 210/276] loss: 0.468 | jepa: 0.468, reg: 0.789 | input_var: 1.232, min: 0.420 | [wd: 4.00e-02, lr: 2.08e-04] | GPU mem: 33607.79MB | gpu_time: 3709.65ms, wall_time: 4390.04ms
+[Epoch 1, Iter 220/276] loss: 0.462 | jepa: 0.462, reg: 0.787 | input_var: 1.233, min: 0.419 | [wd: 4.00e-02, lr: 2.09e-04] | GPU mem: 33851.57MB | gpu_time: 3708.47ms, wall_time: 4388.66ms
+[Epoch 1, Iter 230/276] loss: 0.457 | jepa: 0.457, reg: 0.786 | input_var: 1.235, min: 0.423 | [wd: 4.00e-02, lr: 2.09e-04] | GPU mem: 33851.57MB | gpu_time: 3706.23ms, wall_time: 4385.39ms
+[Epoch 1, Iter 240/276] loss: 0.451 | jepa: 0.451, reg: 0.785 | input_var: 1.234, min: 0.426 | [wd: 4.00e-02, lr: 2.09e-04] | GPU mem: 33851.57MB | gpu_time: 3705.09ms, wall_time: 4384.93ms
+[Epoch 1, Iter 250/276] loss: 0.447 | jepa: 0.447, reg: 0.784 | input_var: 1.232, min: 0.423 | [wd: 4.00e-02, lr: 2.10e-04] | GPU mem: 33851.57MB | gpu_time: 3702.55ms, wall_time: 4381.54ms
+[Epoch 1, Iter 260/276] loss: 0.442 | jepa: 0.442, reg: 0.783 | input_var: 1.234, min: 0.423 | [wd: 4.00e-02, lr: 2.10e-04] | GPU mem: 33851.57MB | gpu_time: 3703.74ms, wall_time: 4381.92ms
+[Epoch 1, Iter 270/276] loss: 0.438 | jepa: 0.438, reg: 0.783 | input_var: 1.232, min: 0.422 | [wd: 4.00e-02, lr: 2.10e-04] | GPU mem: 33851.57MB | gpu_time: 3701.40ms, wall_time: 4379.24ms
+[INFO] Epoch 1 finished. Avg loss = 0.436
+/home/madhavan/jepa/app/vjepa/train_combined.py:481: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+[Eval @ epoch 1] eval_loss: 0.318, eval_jepa: 0.318, eval_reg: 0.778
+[INFO] Checkpoint saved to /home/madhavan/jepa/logging/stage1_long_train_combined-latest.pth.tar
+[INFO] Starting epoch 2/400
+[INFO] Data loader exhausted. Re-initializing iterator...
+[Epoch 2, Iter 0/276] loss: 0.319 | jepa: 0.319, reg: 0.777 | input_var: 1.264, min: 0.527 | [wd: 4.00e-02, lr: 2.11e-04] | GPU mem: 33851.57MB | gpu_time: 3537.85ms, wall_time: 4251.18ms
+[Epoch 2, Iter 10/276] loss: 0.306 | jepa: 0.306, reg: 0.775 | input_var: 1.217, min: 0.430 | [wd: 4.00e-02, lr: 2.11e-04] | GPU mem: 33851.57MB | gpu_time: 3644.78ms, wall_time: 4309.55ms
+[Epoch 2, Iter 20/276] loss: 0.300 | jepa: 0.300, reg: 0.774 | input_var: 1.212, min: 0.419 | [wd: 4.00e-02, lr: 2.11e-04] | GPU mem: 33851.57MB | gpu_time: 3638.69ms, wall_time: 4315.35ms
+[Epoch 2, Iter 30/276] loss: 0.301 | jepa: 0.301, reg: 0.775 | input_var: 1.204, min: 0.436 | [wd: 4.00e-02, lr: 2.12e-04] | GPU mem: 33851.57MB | gpu_time: 3619.52ms, wall_time: 4298.31ms
+[Epoch 2, Iter 40/276] loss: 0.296 | jepa: 0.296, reg: 0.776 | input_var: 1.208, min: 0.450 | [wd: 4.00e-02, lr: 2.12e-04] | GPU mem: 33851.57MB | gpu_time: 3612.50ms, wall_time: 4291.57ms
+[Epoch 2, Iter 50/276] loss: 0.296 | jepa: 0.296, reg: 0.777 | input_var: 1.215, min: 0.456 | [wd: 4.00e-02, lr: 2.13e-04] | GPU mem: 33851.57MB | gpu_time: 3623.60ms, wall_time: 4303.29ms
+[Epoch 2, Iter 60/276] loss: 0.293 | jepa: 0.293, reg: 0.778 | input_var: 1.215, min: 0.449 | [wd: 4.00e-02, lr: 2.13e-04] | GPU mem: 33851.57MB | gpu_time: 3620.56ms, wall_time: 4298.65ms
+[Epoch 2, Iter 70/276] loss: 0.289 | jepa: 0.289, reg: 0.781 | input_var: 1.222, min: 0.442 | [wd: 4.00e-02, lr: 2.13e-04] | GPU mem: 33851.57MB | gpu_time: 3633.15ms, wall_time: 4313.29ms
+[Epoch 2, Iter 80/276] loss: 0.287 | jepa: 0.287, reg: 0.783 | input_var: 1.228, min: 0.456 | [wd: 4.00e-02, lr: 2.14e-04] | GPU mem: 33851.57MB | gpu_time: 3633.67ms, wall_time: 4313.41ms
+[Epoch 2, Iter 90/276] loss: 0.284 | jepa: 0.284, reg: 0.786 | input_var: 1.232, min: 0.454 | [wd: 4.00e-02, lr: 2.14e-04] | GPU mem: 33851.57MB | gpu_time: 3633.81ms, wall_time: 4314.94ms
+[Epoch 2, Iter 100/276] loss: 0.282 | jepa: 0.282, reg: 0.788 | input_var: 1.236, min: 0.442 | [wd: 4.00e-02, lr: 2.15e-04] | GPU mem: 33851.57MB | gpu_time: 3646.85ms, wall_time: 4327.59ms
+[Epoch 2, Iter 110/276] loss: 0.279 | jepa: 0.279, reg: 0.790 | input_var: 1.236, min: 0.447 | [wd: 4.00e-02, lr: 2.15e-04] | GPU mem: 33851.57MB | gpu_time: 3652.95ms, wall_time: 4333.53ms
+[Epoch 2, Iter 120/276] loss: 0.276 | jepa: 0.276, reg: 0.793 | input_var: 1.235, min: 0.446 | [wd: 4.00e-02, lr: 2.15e-04] | GPU mem: 33851.57MB | gpu_time: 3655.88ms, wall_time: 4333.47ms
+[Epoch 2, Iter 130/276] loss: 0.273 | jepa: 0.273, reg: 0.796 | input_var: 1.232, min: 0.446 | [wd: 4.00e-02, lr: 2.16e-04] | GPU mem: 33851.57MB | gpu_time: 3654.62ms, wall_time: 4332.88ms
+[Epoch 2, Iter 140/276] loss: 0.271 | jepa: 0.271, reg: 0.799 | input_var: 1.233, min: 0.437 | [wd: 4.00e-02, lr: 2.16e-04] | GPU mem: 33851.57MB | gpu_time: 3649.20ms, wall_time: 4325.85ms
+[Epoch 2, Iter 150/276] loss: 0.269 | jepa: 0.269, reg: 0.802 | input_var: 1.236, min: 0.437 | [wd: 4.00e-02, lr: 2.16e-04] | GPU mem: 33851.57MB | gpu_time: 3652.75ms, wall_time: 4327.64ms
+[Epoch 2, Iter 160/276] loss: 0.268 | jepa: 0.268, reg: 0.804 | input_var: 1.233, min: 0.436 | [wd: 4.00e-02, lr: 2.17e-04] | GPU mem: 33851.57MB | gpu_time: 3648.29ms, wall_time: 4322.19ms
+[Epoch 2, Iter 170/276] loss: 0.266 | jepa: 0.266, reg: 0.807 | input_var: 1.230, min: 0.434 | [wd: 4.00e-02, lr: 2.17e-04] | GPU mem: 33851.57MB | gpu_time: 3648.71ms, wall_time: 4321.80ms
+[Epoch 2, Iter 180/276] loss: 0.264 | jepa: 0.264, reg: 0.809 | input_var: 1.230, min: 0.433 | [wd: 4.00e-02, lr: 2.18e-04] | GPU mem: 33851.57MB | gpu_time: 3648.76ms, wall_time: 4322.16ms
+[Epoch 2, Iter 190/276] loss: 0.263 | jepa: 0.263, reg: 0.811 | input_var: 1.230, min: 0.431 | [wd: 4.00e-02, lr: 2.18e-04] | GPU mem: 33851.57MB | gpu_time: 3644.64ms, wall_time: 4317.21ms
+[Epoch 2, Iter 200/276] loss: 0.261 | jepa: 0.261, reg: 0.813 | input_var: 1.232, min: 0.431 | [wd: 4.00e-02, lr: 2.18e-04] | GPU mem: 33851.57MB | gpu_time: 3646.17ms, wall_time: 4318.78ms
+[Epoch 2, Iter 210/276] loss: 0.260 | jepa: 0.260, reg: 0.814 | input_var: 1.232, min: 0.432 | [wd: 4.00e-02, lr: 2.19e-04] | GPU mem: 33851.57MB | gpu_time: 3649.20ms, wall_time: 4320.70ms
+[Epoch 2, Iter 220/276] loss: 0.259 | jepa: 0.259, reg: 0.816 | input_var: 1.234, min: 0.433 | [wd: 4.00e-02, lr: 2.19e-04] | GPU mem: 33851.57MB | gpu_time: 3646.53ms, wall_time: 4317.92ms
+[Epoch 2, Iter 230/276] loss: 0.258 | jepa: 0.258, reg: 0.818 | input_var: 1.234, min: 0.429 | [wd: 4.00e-02, lr: 2.20e-04] | GPU mem: 33851.57MB | gpu_time: 3648.55ms, wall_time: 4320.50ms
+[Epoch 2, Iter 240/276] loss: 0.257 | jepa: 0.257, reg: 0.819 | input_var: 1.236, min: 0.432 | [wd: 4.00e-02, lr: 2.20e-04] | GPU mem: 33851.57MB | gpu_time: 3647.39ms, wall_time: 4319.67ms
+[Epoch 2, Iter 250/276] loss: 0.256 | jepa: 0.256, reg: 0.820 | input_var: 1.236, min: 0.434 | [wd: 4.00e-02, lr: 2.20e-04] | GPU mem: 33851.57MB | gpu_time: 3645.39ms, wall_time: 4317.19ms
+[Epoch 2, Iter 260/276] loss: 0.256 | jepa: 0.256, reg: 0.822 | input_var: 1.234, min: 0.435 | [wd: 4.00e-02, lr: 2.21e-04] | GPU mem: 33851.57MB | gpu_time: 3643.96ms, wall_time: 4315.71ms
+[Epoch 2, Iter 270/276] loss: 0.255 | jepa: 0.255, reg: 0.823 | input_var: 1.234, min: 0.436 | [wd: 4.00e-02, lr: 2.21e-04] | GPU mem: 34039.73MB | gpu_time: 3644.84ms, wall_time: 4317.39ms
+[INFO] Epoch 2 finished. Avg loss = 0.255
+[Eval @ epoch 2] eval_loss: 0.239, eval_jepa: 0.239, eval_reg: 0.849
+[INFO] Checkpoint saved to /home/madhavan/jepa/logging/stage1_long_train_combined-latest.pth.tar
+[INFO] Starting epoch 3/400
+[INFO] Data loader exhausted. Re-initializing iterator...
+[Epoch 3, Iter 0/276] loss: 0.247 | jepa: 0.247, reg: 0.844 | input_var: 1.353, min: 0.332 | [wd: 4.00e-02, lr: 2.21e-04] | GPU mem: 34039.73MB | gpu_time: 3229.49ms, wall_time: 3938.12ms
+[Epoch 3, Iter 10/276] loss: 0.241 | jepa: 0.241, reg: 0.859 | input_var: 1.274, min: 0.422 | [wd: 4.00e-02, lr: 2.22e-04] | GPU mem: 34039.73MB | gpu_time: 3614.16ms, wall_time: 4291.32ms
+[Epoch 3, Iter 20/276] loss: 0.241 | jepa: 0.241, reg: 0.855 | input_var: 1.260, min: 0.403 | [wd: 4.00e-02, lr: 2.22e-04] | GPU mem: 34039.73MB | gpu_time: 3604.47ms, wall_time: 4275.14ms
+[Epoch 3, Iter 30/276] loss: 0.240 | jepa: 0.240, reg: 0.852 | input_var: 1.239, min: 0.421 | [wd: 4.00e-02, lr: 2.22e-04] | GPU mem: 34927.70MB | gpu_time: 3630.52ms, wall_time: 4295.18ms
+[Epoch 3, Iter 40/276] loss: 0.239 | jepa: 0.239, reg: 0.855 | input_var: 1.228, min: 0.421 | [wd: 4.00e-02, lr: 2.23e-04] | GPU mem: 34927.70MB | gpu_time: 3632.46ms, wall_time: 4302.80ms
+[Epoch 3, Iter 50/276] loss: 0.238 | jepa: 0.238, reg: 0.854 | input_var: 1.231, min: 0.437 | [wd: 4.00e-02, lr: 2.23e-04] | GPU mem: 34927.70MB | gpu_time: 3645.09ms, wall_time: 4319.47ms
+[Epoch 3, Iter 60/276] loss: 0.237 | jepa: 0.237, reg: 0.854 | input_var: 1.233, min: 0.425 | [wd: 4.00e-02, lr: 2.24e-04] | GPU mem: 34927.70MB | gpu_time: 3643.45ms, wall_time: 4319.06ms
+[Epoch 3, Iter 70/276] loss: 0.237 | jepa: 0.237, reg: 0.854 | input_var: 1.235, min: 0.433 | [wd: 4.00e-02, lr: 2.24e-04] | GPU mem: 34927.70MB | gpu_time: 3637.67ms, wall_time: 4310.33ms
+[Epoch 3, Iter 80/276] loss: 0.237 | jepa: 0.237, reg: 0.855 | input_var: 1.231, min: 0.426 | [wd: 4.00e-02, lr: 2.24e-04] | GPU mem: 34927.70MB | gpu_time: 3623.96ms, wall_time: 4298.52ms
+[Epoch 3, Iter 90/276] loss: 0.237 | jepa: 0.237, reg: 0.855 | input_var: 1.232, min: 0.425 | [wd: 4.00e-02, lr: 2.25e-04] | GPU mem: 34927.70MB | gpu_time: 3631.22ms, wall_time: 4310.52ms

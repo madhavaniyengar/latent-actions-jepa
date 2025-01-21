@@ -1,0 +1,8 @@
+{"time":"2025-01-21T14:41:30.335954171-05:00","level":"INFO","msg":"using version","core version":"0.18.5"}
+{"time":"2025-01-21T14:41:30.335975-05:00","level":"INFO","msg":"created symlink","path":"/home/madhavan/jepa/wandb/run-20250121_144130-q915h6hs/logs/debug-core.log"}
+{"time":"2025-01-21T14:41:30.843880063-05:00","level":"INFO","msg":"created new stream","id":"q915h6hs"}
+{"time":"2025-01-21T14:41:30.843905361-05:00","level":"INFO","msg":"stream: started","id":"q915h6hs"}
+{"time":"2025-01-21T14:41:30.843979121-05:00","level":"INFO","msg":"sender: started","stream_id":"q915h6hs"}
+{"time":"2025-01-21T14:41:30.843938414-05:00","level":"INFO","msg":"writer: Do: started","stream_id":{"value":"q915h6hs"}}
+{"time":"2025-01-21T14:41:30.843943954-05:00","level":"INFO","msg":"handler: started","stream_id":{"value":"q915h6hs"}}
+{"time":"2025-01-21T14:41:31.060641658-05:00","level":"INFO","msg":"Starting system monitor"}

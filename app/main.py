@@ -32,7 +32,7 @@ def init_distributed(rank_and_world_size, backend='nccl', init_method='env://'):
     """Initialize distributed process group."""
     rank, world_size = rank_and_world_size
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = str(12357)  # Ensure unique port for each rank
+    os.environ['MASTER_PORT'] = str(12356)  # Ensure unique port for each rank
     dist.init_process_group(
         backend=backend,
         init_method=init_method,
