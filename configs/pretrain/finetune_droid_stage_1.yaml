@@ -32,7 +32,7 @@ data_aug:
   reprob: 0.0
 logging:
   folder: /home/madhavan/jepa/logging/
-  write_tag: stage1_long_train_combined
+  write_tag: stage1_long_train_combined_no_tl
 loss:
   loss_exp: 1.0
   reg_coeff: 0.0
@@ -78,14 +78,14 @@ model:
   use_mask_tokens: true
   zero_init_mask_tokens: true
   action_dim: 1024
-  token_learning_model: 'tokenlearner'
+  token_learning_model: 'avgpool'
 optimization:
   # ipe: 300
   ipe_scale: 1.25
   clip_grad: 10.0
   weight_decay: 0.04
   final_weight_decay: 0.4
-  epochs: 400
+  epochs: 100
   warmup: 40
   start_lr: 0.0002
   lr: 0.000625

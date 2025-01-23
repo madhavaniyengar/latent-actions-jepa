@@ -268,10 +268,14 @@ class VisionTransformerPredictor(nn.Module):
         x = self.predictor_norm(x)
 
         # Return output corresponding to target tokens
-        x = x[:, N_ctxt:N_ctxt + pred_tokens.size(1)]  # Exclude action tokens
-        x = self.predictor_proj(x)
+        # x = x[:, N_ctxt:N_ctxt + pred_tokens.size(1)]  # Exclude action tokens
+        # x_action = x[:, N_ctxt+pred_tokens.size(1):]
+        
+        x_ = self.predictor_proj(x)
+        x_action = x_[:, N_ctxt + pred_tokens.size(1):] 
+        x = x_[:, N_ctxt:N_ctxt + pred_tokens.size(1)] 
 
-        return x
+        return x, x_action
 
 
 def vit_predictor(**kwargs):

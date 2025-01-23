@@ -1,7 +1,7 @@
 torch>=2
 torchvision
 pyyaml
-numpy
+numpy==2.0.2
 opencv-python
 submitit
 braceexpand

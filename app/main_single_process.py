@@ -15,7 +15,6 @@ import torch.distributed as dist
 import torch
 from app.scaffold import main as app_main
 from src.utils.logging import get_logger
-from src.utils.distributed import init_distributed
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -29,17 +28,23 @@ parser.add_argument(
     '--train_script', type=str, default='train',
     help='which script to run (train or train_causal_mask)')
 
-def process_main(rank, fname, world_size, devices, train_script):
+def init_distributed(rank_and_world_size, backend='nccl', init_method='env://'):
+    """Initialize distributed process group."""
+    rank, world_size = rank_and_world_size
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '29500'
-    os.environ['WORLD_SIZE'] = str(world_size)
-    os.environ['RANK'] = str(rank)
+    os.environ['MASTER_PORT'] = str(12357)  # Ensure unique port for each rank
+    dist.init_process_group(
+        backend=backend,
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size
+    )
+    torch.cuda.set_device(rank)  # Set the appropriate device for the rank
+    return world_size, rank
 
-    local_gpu_id = devices[rank].split(":")[-1]
-    os.environ["CUDA_VISIBLE_DEVICES"] = local_gpu_id
+def process_main(rank, fname, world_size, devices, train_script):
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(devices[rank].split(':')[-1])
 
-    import logging
-    from src.utils.logging import get_logger
     logger = get_logger(force=True)
     if rank == 0:
         logger.setLevel(logging.INFO)
@@ -49,7 +54,6 @@ def process_main(rank, fname, world_size, devices, train_script):
     logger.info(f'called-params {fname}')
 
     # Load config
-    params = None
     with open(fname, 'r') as y_file:
         params = yaml.load(y_file, Loader=yaml.FullLoader)
         logger.info('loaded params...')
@@ -62,20 +66,33 @@ def process_main(rank, fname, world_size, devices, train_script):
             yaml.dump(params, f)
 
     # Init distributed (access to comm between GPUS on same machine)
-    world_size, rank = init_distributed(rank_and_world_size=(rank, world_size))
-    logger.info(f'Running... (rank: {rank}/{world_size})')
+    if not dist.is_initialized():
+        world_size, rank = init_distributed(rank_and_world_size=(rank, world_size))
+        logger.info(f'Initialized distributed process group (rank: {rank}, world_size: {world_size})')
+    else:
+        logger.info(f'Distributed process group already initialized for rank {rank}.')
 
-    # Launch the app with loaded config
-    app_main(params['app'], args=params, train_script=train_script)
-
+    try:
+        # Launch the app with loaded config
+        app_main(params['app'], args=params, train_script=train_script)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+            logger.info(f'Destroyed process group for rank {rank}.')
 
 if __name__ == '__main__':
     args = parser.parse_args()
     num_gpus = len(args.devices)
     mp.set_start_method('spawn')
-    
+    processes = []
+
     for rank in range(num_gpus):
-        mp.Process(
+        process = mp.Process(
             target=process_main,
             args=(rank, args.fname, num_gpus, args.devices, args.train_script)
-        ).start()
+        )
+        process.start()
+        processes.append(process)
+
+    for process in processes:
+        process.join()

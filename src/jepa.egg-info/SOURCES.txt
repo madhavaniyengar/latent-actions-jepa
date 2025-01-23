@@ -17,8 +17,10 @@ src/jepa.egg-info/requires.txt
 src/jepa.egg-info/top_level.txt
 src/masks/default.py
 src/masks/multiblock3d.py
+src/masks/random_p.py
 src/masks/random_tube.py
 src/masks/utils.py
+src/models/action_vision_transformer.py
 src/models/attentive_pooler.py
 src/models/predictor.py
 src/models/vision_transformer.py

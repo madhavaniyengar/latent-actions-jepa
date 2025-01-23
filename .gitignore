@@ -9,3 +9,5 @@ ckpts/
 dist/
 data/
 environment.yml
+wandb/
+build/
