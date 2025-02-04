@@ -186,7 +186,7 @@ def main(args, resume_preempt=False):
 
         if not os.path.exists(load_path):
             load_path = None
-            load_model = False
+            lnoad_model = False
 
     # -----------------------------------------------------------------------
     #  Initialize Weights & Biases
@@ -379,6 +379,7 @@ def main(args, resume_preempt=False):
         (encoder,
          predictor,
          target_encoder,
+         action_model,
          optimizer,
          scaler,
          start_epoch) = load_checkpoint(
@@ -387,7 +388,8 @@ def main(args, resume_preempt=False):
              predictor=predictor,
              target_encoder=target_encoder,
              opt=optimizer,
-             scaler=scaler
+             scaler=scaler,
+             action_model=action_model
         )
         for _ in range(start_epoch * ipe):
             scheduler.step()

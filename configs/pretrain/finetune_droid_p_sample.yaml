@@ -8,7 +8,7 @@ data:
   eval_datasets:
     - /home/madhavan/jepa/data/droid_videos_2/video_labels_eval.csv
   decode_one_clip: true
-  batch_size: 24 # 24 -> 2
+  batch_size: 1 # 24 -> 2
   num_clips: 1
   num_frames: 16
   tubelet_size: 2

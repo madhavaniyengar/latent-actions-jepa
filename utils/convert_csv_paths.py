@@ -16,12 +16,12 @@ def convert_paths(input_file, output_file):
             if len(row) == 2:  # Ensure the row has the expected structure
                 old_path, number = row
                 # Replace the base path
-                new_path = old_path.replace("/nfs/turbo/jjparkcv-turbo-large/miyen", "/home/madhavan/jepa/data")
+                new_path = old_path.replace("/home/madhavan/jepa/", "/home/madhavan/jepa/data/")
                 writer.writerow([new_path, number])
             else:
                 print(f"Skipping malformed row: {row}")
 
 # Example usage:
-input_csv = "/home/madhavan/jepa/data/droid_videos_2/video_labels_old.csv"  # Replace with your input CSV file name
-output_csv = "/home/madhavan/jepa/data/droid_videos_2/video_labels.csv"  # Replace with your desired output CSV file name
+input_csv = "/home/madhavan/jepa/data/droid_videos/video_labels_old.csv"  # Replace with your input CSV file name
+output_csv = "/home/madhavan/jepa/data/droid_videos/video_labels.csv"  # Replace with your desired output CSV file name
 convert_paths(input_csv, output_csv)

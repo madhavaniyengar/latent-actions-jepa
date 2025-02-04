@@ -41,6 +41,10 @@ from app.vjepa.transforms import make_transforms
 from transformers import CLIPTokenizer, CLIPTextModel
 from models.TokenLearner import TokenLearner
 
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+
+
 # --------------------------------------------------------------------
 # Original script constants
 log_timings = True
@@ -436,558 +440,169 @@ def main(args, resume_preempt=False):
             except StopIteration:
                 loader_iter = iter(unsupervised_loader)
                 udata = next(loader_iter)
+    # Put all models in eval mode
+    encoder.eval()
+    predictor.eval()
+    action_model.eval()
+    target_encoder.eval()
+    if token_learner is not None:
+        token_learner.eval()
 
-    def evaluate(
-        encoder, predictor, action_model, token_learner, target_encoder, data_loader, device, clip_model, clip_tokenizer,
-        dtype, mixed_precision, mask_type, num_clips, loss_exp, reg_coeff, wandb, global_step=0, rank=0, epoch=0, num_frames=16,         # use your default
-    ):
-        """
-        Evaluate on a given data_loader, mirroring the training flow
-        so that inputs and forward passes match exactly.
-        """
+    # We will collect latent actions for the first TWO episodes/batches
+    num_episodes_to_collect = 2
+    latent_actions_list = []
+    labels_list = []
 
-        encoder.eval()
-        predictor.eval()
-        action_model.eval()
-        if token_learner is not None:
-            token_learner.eval()  # If you are using TokenLearner
-        target_encoder.eval()
-
-        # Meters
-        eval_loss_meter = AverageMeter()
-        eval_jepa_meter = AverageMeter()
-        eval_action_meter = AverageMeter()
-        eval_reg_meter = AverageMeter()
-
-        # Disable grad
-        print('[INFO] Starting evaluation...')
-        with torch.no_grad():
-            for batch_idx, batch_datapoint in enumerate(data_loader):
-                # -------------------------------------------
-                # Handle data and masks exactly as in training
-                # -------------------------------------------
-                if mask_type == 'multiblock3d':
-                    udata, masks_enc, masks_pred = batch_datapoint
-                    # For example, if you deduce p from num_frames in training:
-                    p = [num_frames // 2] * udata[0][0].size(0)  # B
-                elif mask_type == 'random_p':
-                    udata, masks_enc, masks_pred, p = batch_datapoint
-                else:
-                    # adapt if you have other mask types
-                    udata, masks_enc, masks_pred = batch_datapoint
-                    p = None
-
-                # Combine the multiple video clips in `udata[0]`
-                clips = torch.cat(
-                    [u.to(device, non_blocking=True) for u in udata[0]], dim=0
-                )
-                batch_size = len(udata[0][0])  # e.g., if udata[0] is a list of (B, C, T, H, W)
-
-                # Generate text embeddings (same as training)
-                labels = udata[1]
-                labels = [' '.join(l.split('_')) for l in labels]
-                input_ids = clip_tokenizer(labels, padding=True, return_tensors='pt').input_ids.to(device)
-
-                text_embeddings = clip_model(input_ids).last_hidden_state  # [B, seq_len, D]
-                text_embeddings = text_embeddings.mean(dim=1, keepdim=True)  # [B,1,D]
-
-                # Move masks to device, repeat them to match the number of clips
-                _masks_enc, _masks_pred = [], []
-                for _me, _mp in zip(masks_enc, masks_pred):
-                    _me = _me.to(device, non_blocking=True)
-                    _mp = _mp.to(device, non_blocking=True)
-                    # repeat_interleave_batch is your helper to match the B x num_clips dimension
-                    _me = repeat_interleave_batch(_me, batch_size, repeat=num_clips)
-                    _mp = repeat_interleave_batch(_mp, batch_size, repeat=num_clips)
-                    _masks_enc.append(_me)
-                    _masks_pred.append(_mp)
-
-                # -------------------------------------------
-                # Forward pass: same as training, but no grad
-                # -------------------------------------------
-                with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-
-                    # === 1) TARGET ENCODER + ACTION MODEL ===
-                    # Just like `forward_target_with_actions`
-                    h = target_encoder(clips)
-                    h = F.layer_norm(h, (h.size(-1),))
-                    # Apply predictor masks to produce "target" splits
-                    h_splits = apply_masks(h, _masks_pred, concat=False)
-                    h = [h] * 2
-
-                    # If you have frames p, gather action tokens from target
-                    if p is not None:
-                        # Reshape each masked target to (B, #frames, #tokens_per_frame, D)
-                        per_frame_embeddings_h = []
-                        for seq, pi_ in zip(h, [num_frames // 2] * batch_size):
-                            # seq is [B, tokens, D]
-                            reshaped = seq.reshape(
-                                seq.size(0),   # B
-                                pi_,
-                                seq.size(1)//pi_,
-                                seq.size(-1)
-                            )
-                            if token_learner is not None:
-                                reshaped = reshaped.view(reshaped.size(0), -1, reshaped.size(-1))
-                                learned_tokens = token_learner(reshaped)
-                            else:
-                                learned_tokens = reshaped.mean(dim=2)
-                            per_frame_embeddings_h.append(learned_tokens)
-                        
-                        # Pass text embeddings + frames into action_model
-                        action_model_input_h = [
-                            torch.cat([text_embeddings.repeat(1, 1, 2), tfe], dim=1)
-                            for tfe in per_frame_embeddings_h
-                        ]
-                        h_actions = [action_model(ami) for ami in action_model_input_h]
-                    else:
-                        # If you don't handle p, then h_actions can be None
-                        h_actions = None
-
-                    # === 2) CONTEXT ENCODER + ACTION MODEL + PREDICTOR ===
-                    # Just like `forward_context`
-                    z = encoder(clips, _masks_enc)
-
-                    # If using p & token_learner, gather action tokens from context
-                    if p is not None:
-                        per_frame_embeddings_z = []
-                        for seq, pi_ in zip(z, p):
-                            reshaped = seq.reshape(
-                                seq.size(0),
-                                pi_,
-                                seq.size(1)//pi_,
-                                seq.size(-1)
-                            )
-                            if learned_tokens.size(1) < num_frames // 2:
-                                pad_tokens = torch.zeros(
-                                    learned_tokens.size(0),
-                                    num_frames // 2 - learned_tokens.size(1),
-                                    learned_tokens.size(-1)
-                                ).to(learned_tokens.device)
-                                learned_tokens = torch.cat([learned_tokens, pad_tokens], dim=1)
-
-                        action_model_input_z = [
-                            torch.cat([text_embeddings.repeat(1, 1, 2), tfe], dim=1)
-                            for tfe in per_frame_embeddings_z
-                        ]
-                        z_actions_input = [action_model(ami) for ami in action_model_input_z]
-                    else:
-                        z_actions_input = None
-
-                    # Pass through predictor
-                    # (Some code might expect predictor(...) to return (z_pred_splits, z_action_splits) 
-                    #  or you can separate them if you have a custom code.)
-                    z_tuple = predictor(
-                        z,
-                        h_splits,
-                        _masks_enc,
-                        _masks_pred,
-                        z_actions_input
-                    )
-                    
-                    z_pred_splits = [zi for zi, zai in z_tuple]
-                    z_actions_splits = [zai for zi, zai in z_tuple]
-                    
-                    if len(z_pred_splits) == 0:
-                    # e.g. just continue to next batch
-                        continue
-    
-
-                    # === 3) Compute the same set of losses ===
-                    # JEPA
-                    loss_jepa = 0.
-                    for zi, hi in zip(z_pred_splits, h_splits):
-                        loss_jepa += torch.mean(torch.abs(zi - hi) ** loss_exp) / loss_exp
-                    loss_jepa /= len(_masks_pred)
-
-                    # Action loss (if you do the same as in training)
-                    # For example, matching z_actions_splits to h_actions
-                    if (z_actions_splits is not None) and (h_actions is not None):
-                        loss_action = 0.
-                        for zai, hai in zip(z_actions_splits, h_actions):
-                            loss_action += torch.mean(torch.abs(zai - hai) ** loss_exp) / loss_exp
-                        loss_action /= len(_masks_pred)
-                    else:
-                        loss_action = 0.
-
-                    # Regularization
-                    pstd_z = sum([torch.sqrt(zi.var(dim=1) + 0.0001) for zi in z_pred_splits]) / len(z_pred_splits)
-                    loss_reg = torch.mean(F.relu(1. - pstd_z))
-
-                    # Total
-                    loss_eval = loss_jepa + loss_action + reg_coeff * loss_reg
-
-                # -------------------------------------------
-                # Update meters
-                # -------------------------------------------
-                eval_loss_meter.update(loss_eval.item())
-                eval_jepa_meter.update(loss_jepa.item())
-                eval_action_meter.update(loss_action if isinstance(loss_action, float) else loss_action.item())
-                eval_reg_meter.update(loss_reg.item())
-
-                # -------------------------------------------
-                # Optional: step-wise logging to W&B
-                # If you'd rather do it once at the end, remove this.
-                # -------------------------------------------
-                if rank == 0:
-                    wandb_dict = {
-                        "eval/epoch": epoch,
-                        "eval/iter": batch_idx,
-                        "eval/global_step": global_step,
-                        "eval/loss": loss_eval.item(),
-                        "eval/loss_jepa": loss_jepa.item(),
-                        "eval/loss_action": loss_action.item() if isinstance(loss_action, torch.Tensor) else loss_action,
-                        "eval/loss_reg": loss_reg.item(),
-                    }
-                    wandb.log(wandb_dict, step=global_step)
-
-        # -------------------------------------------
-        # Restore model to train mode
-        # -------------------------------------------
-        encoder.train()
-        predictor.train()
-        action_model.train()
-        if token_learner is not None:
-            token_learner.train()
-        target_encoder.train()
-
-        # -------------------------------------------
-        # Aggregate final results
-        # Optionally, log these as well
-        # -------------------------------------------
-        final_loss = eval_loss_meter.avg
-        final_jepa = eval_jepa_meter.avg
-        final_action = eval_action_meter.avg
-        final_reg = eval_reg_meter.avg
-
-        if rank == 0:
-            wandb.log({
-                "eval/final_loss": final_loss,
-                "eval/final_jepa": final_jepa,
-                "eval/final_action": final_action,
-                "eval/final_reg": final_reg,
-            }, step=global_step)
-
-        return final_loss, final_jepa, final_action, final_reg
-
-    # --------------------------------------------------------------------
-    # Training loop
-    # --------------------------------------------------------------------
-    loader_iter = iter(unsupervised_loader)
-    global_step = start_epoch * ipe
-
-    for epoch in range(start_epoch, num_epochs):
-        print(f'[INFO] Starting epoch {epoch + 1}/{num_epochs}')
-
-        # update distributed-data-loader epoch
-        unsupervised_sampler.set_epoch(epoch)
-
-        # Meters
-        loss_meter = AverageMeter()
-        input_var_meter = AverageMeter()
-        input_var_min_meter = AverageMeter()
-        jepa_loss_meter = AverageMeter()
-        reg_loss_meter = AverageMeter()
-        action_loss_meter = AverageMeter()
-        mask_meters = [AverageMeter() for _ in range(len(cfgs_mask))]
-        gpu_time_meter = AverageMeter()
-        wall_time_meter = AverageMeter()
-
-        for itr in range(ipe):
-            itr_start_time = time.time()
-            global_step = epoch * ipe + itr
-
-            # Refresh data if needed
+    print("[INFO] Collecting latent actions for the first two episodes...")
+    with torch.no_grad():
+        loader_iter = iter(eval_loader)
+        for batch_idx in range(num_episodes_to_collect):
             try:
-                loader_data = next(loader_iter)
-            except Exception:
-                print('[INFO] Data loader exhausted. Re-initializing iterator...')
-                loader_iter = iter(unsupervised_loader)
-                loader_data = next(loader_iter)
-            if mask_type == 'multiblock3d':
-                udata, masks_enc, masks_pred = loader_data
-                p = [num_frames // 2]  * batch_size
-            elif mask_type == 'random_p':
-                udata, masks_enc, masks_pred, p = loader_data
-            # Quick assertion
-            assert len(masks_enc) == len(masks_pred), \
-                'Need num encoder masks == num predictor masks'
-                
-            # break
+                batch_data = next(loader_iter)
+            except StopIteration:
+                print("[WARN] eval_loader exhausted before 2 episodes.")
+                break
 
-            def load_clips():
-                # Combine the multiple video clips in `udata[0]`
-                clips = torch.cat([u.to(device, non_blocking=True) for u in udata[0]], dim=0)
-                labels = udata[1]
-                labels = [' '.join(l.split('_')) for l in labels]
-                input_ids = clip_tokenizer(labels, padding=True, return_tensors='pt').input_ids.to(device)
+            # Depending on your mask type:
+            #  - random_p => (udata, masks_enc, masks_pred, p)
+            #  - multiblock3d => (udata, masks_enc, masks_pred)
+            # Adapt as needed:
+            if mask_type == 'random_p':
+                udata, masks_enc, masks_pred, p = batch_data
+            else:
+                udata, masks_enc, masks_pred = batch_data
+                p = [num_frames // 2] * batch_size  # or [num_frames//2] * B, if your code requires it
 
-                with torch.no_grad():
-                    text_embeddings = clip_model(input_ids).last_hidden_state
-                text_embeddings = text_embeddings.mean(dim=1, keepdim=True)
+            # ----------------------------------------------------------------
+            #  1) Move video clips, text, masks to device
+            # ----------------------------------------------------------------
+            clips = torch.cat([u.to(device, non_blocking=True) for u in udata[0]], dim=0)
+            batch_size = udata[0][0].shape[0]
 
-                _masks_enc, _masks_pred = [], []
-                for _me, _mp in zip(masks_enc, masks_pred):
-                    _me = _me.to(device, non_blocking=True)
-                    _mp = _mp.to(device, non_blocking=True)
-                    _me = repeat_interleave_batch(_me, batch_size, repeat=num_clips)
-                    _mp = repeat_interleave_batch(_mp, batch_size, repeat=num_clips)
-                    _masks_enc.append(_me)
-                    _masks_pred.append(_mp)
+            # Get text embeddings (similar to training)
+            labels = udata[1]
+            labels = [' '.join(l.split('_')) for l in labels]
+            input_ids = clip_tokenizer(labels, padding=True, return_tensors='pt').input_ids.to(device)
+            text_embeddings = clip_model(input_ids).last_hidden_state  # [B, seq_len, D]
+            text_embeddings = text_embeddings.mean(dim=1, keepdim=True)  # [B,1,D]
 
-                return clips, _masks_enc, _masks_pred, text_embeddings
+            # Move masks to device, repeat them if multiple clips
+            _masks_enc, _masks_pred = [], []
+            for _me, _mp in zip(masks_enc, masks_pred):
+                _me = _me.to(device, non_blocking=True)
+                _mp = _mp.to(device, non_blocking=True)
+                _me = repeat_interleave_batch(_me, batch_size, repeat=num_clips)
+                _mp = repeat_interleave_batch(_mp, batch_size, repeat=num_clips)
+                _masks_enc.append(_me)
+                _masks_pred.append(_mp)
 
-            clips, masks_enc, masks_pred, text_embeddings = load_clips()
-            for i_m, m_meter in enumerate(mask_meters):
-                # Each masks_enc[i_m][0] has shape [B, <mask_dim>], so you can track a dimension or patch count
-                m_meter.update(masks_enc[i_m][0].size(-1))
+            # ----------------------------------------------------------------
+            #  2) Forward pass to get latent actions
+            # ----------------------------------------------------------------
+            # As an example, we do something similar to "forward_target_with_actions" 
+            # plus "forward_context".
+            # The key is we want the outputs of `action_model(...)`.
 
-            def train_step():
-                _new_lr = scheduler.step()
-                _new_wd = wd_scheduler.step()
+            # === target encoder + action_model (like "h_actions") ===
+            h = target_encoder(clips)
+            h = F.layer_norm(h, (h.size(-1),))
+            h_splits = apply_masks(h, _masks_pred, concat=False)
 
-                def forward_target(c):
-                    with torch.no_grad():
-                        h = target_encoder(c)
-                        h = F.layer_norm(h, (h.size(-1),))
-                        # apply mask to create targets
-                        h = apply_masks(h, masks_pred, concat=False)
-                        return h
-                    
-                def forward_target_with_actions(c, text_emb, p):
-                    with torch.no_grad():
-                        h = target_encoder(c)
-                        h = F.layer_norm(h, (h.size(-1),))
-                        h_splits = apply_masks(h, masks_pred, concat=False)
-                        h = [h] * 2
+            if p is not None:
+                # Example: gather frames, pass them through token_learner if used
+                # You might need to adapt the below to your code’s shape
+                # or if p is a single integer repeated B times, do that logic:
+                per_frame_embeddings_h = []
+                for seq in [h]*len(p):
+                    # Reshape each to [B, p_i, tokens_per_frame, D]
+                    # If your code uses (B, T, D) directly, adapt accordingly:
+                    frames = seq.reshape(
+                        seq.size(0),
+                        p[0], 
+                        seq.size(1)//p[0],
+                        seq.size(-1)
+                    )
+                    if token_learner is not None:
+                        frames = frames.view(frames.size(0), -1, frames.size(-1))
+                        frames = token_learner(frames)
+                    else:
+                        frames = frames.mean(dim=2)
+                    per_frame_embeddings_h.append(frames)
 
-                        per_frame_embeddings = []
-                        for seq, pi_ in zip(h, p):
-                            reshaped = seq.reshape(
-                                seq.size(0),   # B
-                                pi_,
-                                seq.size(1)//pi_,
-                                seq.size(-1)
-                            )
-                            if token_learner is not None:
-                                reshaped = reshaped.view(reshaped.size(0), -1, reshaped.size(-1))
-                                learned_tokens = token_learner(reshaped)
-                            else:
-                                learned_tokens = reshaped.mean(dim=2)
-                            per_frame_embeddings.append(learned_tokens)
-                            
-                        action_model_input = [
-                            torch.cat([text_emb.repeat(1, 1, 2), pfe], dim=1)
-                            for pfe in per_frame_embeddings
-                        ]
-                        action_cls_tokens = [action_model(ami) for ami in action_model_input]
+                # Pass text + frames to action_model
+                # We store the result in `latent_actions`.
+                for frames_h in per_frame_embeddings_h:
+                    action_input = torch.cat([text_embeddings.repeat(1, 1, 2), frames_h], dim=1)
+                    latent_actions = action_model(action_input)  # shape [B, D] or something
+                    latent_actions = latent_actions.mean(dim=1)  # shape [B, D]
+                    latent_actions_list.append(latent_actions.cpu().numpy())
+            else:
+                # If `p` is not used or the code is simpler,
+                # you can adapt your approach for how you gather
+                # frames to feed action_model. Possibly your code
+                # uses a different approach for "action tokens."
+                # Example:
+                action_input = torch.cat([text_embeddings, h], dim=1)
+                latent_actions = action_model(action_input)  # shape [B, D]
+                latent_actions = latent_actions.mean(dim=1)  # shape [B, D]
+                latent_actions_list.append(latent_actions.cpu().numpy())
 
-                    return h_splits, action_cls_tokens[:-1]
+            # Keep track of batch labels for coloring if you want:
+            labels_list.extend(labels)
 
-                def forward_context(c, h_splits, text_emb, p_splits):
-                    z = encoder(c, masks_enc)
-                    per_frame_embeddings = []
-                    for seq, pi_ in zip(z, p_splits):
-                        reshaped = seq.reshape(
-                            seq.size(0),   # B
-                            pi_,
-                            seq.size(1)//pi_,
-                            seq.size(-1)
-                        )
-                        if token_learner is not None:
-                            reshaped = reshaped.view(reshaped.size(0), -1, reshaped.size(-1))
-                            learned_tokens = token_learner(reshaped)
-                        else:
-                            learned_tokens = reshaped.mean(dim=2)
-                            
-                        if learned_tokens.size(1) < num_frames // 2:
-                            pad_tokens = torch.zeros(
-                                learned_tokens.size(0),
-                                num_frames // 2 - learned_tokens.size(1),
-                                learned_tokens.size(-1)
-                            ).to(learned_tokens.device)
-                            learned_tokens = torch.cat([learned_tokens, pad_tokens], dim=1)
-                        per_frame_embeddings.append(learned_tokens)
+    print("[INFO] Collected latent actions. Now running t-SNE...")
 
-                    action_model_input = [
-                        torch.cat([text_emb.repeat(1, 1, 2), pfe], dim=1)
-                        for pfe in per_frame_embeddings
-                    ]
-                    action_cls_tokens = [action_model(ami) for ami in action_model_input]
+    # ----------------------------------------------------------------
+    #  3) Concatenate all latent actions and run t-SNE
+    # ----------------------------------------------------------------
+    all_latent_actions = np.concatenate(latent_actions_list, axis=0)  # shape [N1+N2, action_dim]
+    tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+    embeddings_2d = tsne.fit_transform(all_latent_actions)  # shape [N1+N2, 2]
 
-                    z_tuple = predictor(z, h_splits, masks_enc, masks_pred, action_cls_tokens)
-                    z = [zi for zi, zai in z_tuple]
-                    z_actions = [zai for zi, zai in z_tuple]
-                    return z, z_actions
+    
+    episode1_length = latent_actions_list[0].shape[0]  # N1
+    episode2_length = latent_actions_list[1].shape[0]  # N2
 
-                def loss_fn(z_splits, h_splits):
-                    loss_val = 0.
-                    for zi, hi in zip(z_splits, h_splits):
-                        loss_val += torch.mean(torch.abs(zi - hi)**loss_exp) / loss_exp
-                    loss_val /= len(masks_pred)
-                    return loss_val
+    # Indices in the big array
+    ep1_indices = np.arange(0, episode1_length)
+    ep2_indices = np.arange(episode1_length, episode1_length + episode2_length)
 
-                def reg_fn(z_splits):
-                    return sum([torch.sqrt(zi.var(dim=1) + 0.0001) for zi in z_splits]) / len(z_splits)
+    embeddings_ep1 = embeddings_2d[ep1_indices]  # shape [N1, 2]
+    embeddings_ep2 = embeddings_2d[ep2_indices]  # shape [N2, 2]
 
-                # Forward
-                loss_jepa_val, loss_reg_val = 0., 0.
-                with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                    # h_ = forward_target(clips)
-                    nonlocal p
-                    p_target = [num_frames // 2] * batch_size
-                    h_, h_actions = forward_target_with_actions(clips, text_embeddings, p_target)
-                    # h_ = forward_target(clips)
 
-                    z_, z_actions_ = forward_context(clips, h_, text_embeddings, p)
-                    loss_jepa_val = loss_fn(z_, h_)
-                    loss_actions_reg = loss_fn(z_actions_, h_actions)
-                    pstd_z = reg_fn(z_)
-                    loss_reg_val = torch.mean(F.relu(1. - pstd_z))
+    # ----------------------------------------------------------------
+    #  4) Plot t-SNE
+    # ----------------------------------------------------------------
+    plt.figure(figsize=(6, 6))
+    plt.scatter(
+        embeddings_ep1[:, 0],
+        embeddings_ep1[:, 1],
+        s=20,
+        alpha=0.8,
+        c=np.arange(episode1_length),  # color by index
+        cmap='rainbow'                   # 'Blues' goes from light (low idx) to dark (high idx)
+    )
+    plt.title("t-SNE episode 1")
+    # plt.xlabel("Dimension 1")
+    # plt.ylabel("Dimension 2")
+    # plt.colorbar(label="Action Index (Episode 1)")
+    plt.savefig("tsne_latent_actions_ep1.png")
 
-                loss_total = loss_jepa_val + loss_actions_reg + reg_coeff * loss_reg_val
+    # Episode 2
+    plt.figure(figsize=(6, 6))
+    plt.scatter(
+        embeddings_ep2[:, 0],
+        embeddings_ep2[:, 1],
+        s=20,
+        alpha=0.8,
+        c=np.arange(episode2_length),  # color by index
+        cmap='rainbow'
+    )
+    plt.title("t-SNE episode 2")
+    # plt.xlabel("Dimension 1")
+    # plt.ylabel("Dimension 2")
+    # plt.colorbar(label="Action Index (Episode 2)")
+    plt.savefig("tsne_latent_actions_ep2.png")
 
-                # Backward
-                enc_norm, pred_norm = 0., 0.
-                if mixed_precision:
-                    scaler.scale(loss_total).backward()
-                    scaler.unscale_(optimizer)
-                else:
-                    loss_total.backward()
-
-                # Clip grads if needed
-                if (epoch > warmup) and (clip_grad is not None):
-                    enc_norm = torch.nn.utils.clip_grad_norm_(encoder.parameters(), clip_grad)
-                    pred_norm = torch.nn.utils.clip_grad_norm_(predictor.parameters(), clip_grad)
-
-                # Optim step
-                if mixed_precision:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                optimizer.zero_grad()
-
-                # Log param stats
-                grad_stats_enc = grad_logger(encoder.named_parameters())
-                grad_stats_enc.global_norm = float(enc_norm)
-                grad_stats_pred = grad_logger(predictor.named_parameters())
-                grad_stats_pred.global_norm = float(pred_norm)
-                optim_stats = adamw_logger(optimizer)
-
-                # EMA update of target encoder
-                m = next(momentum_scheduler)
-                with torch.no_grad():
-                    for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
-                        param_k.data.mul_(m).add_((1. - m) * param_q.detach().data)
-
-                return (
-                    float(loss_total),
-                    float(loss_jepa_val),
-                    float(loss_reg_val),
-                    float(loss_actions_reg),
-                    _new_lr,
-                    _new_wd,
-                    grad_stats_enc,
-                    grad_stats_pred,
-                    optim_stats
-                )
-
-            (loss_val,
-             loss_jepa_val,
-             loss_reg_val,
-             loss_actions_reg,
-             new_lr,
-             new_wd,
-             grad_stats_enc,
-             grad_stats_pred,
-             optim_stats), gpu_etime_ms = gpu_timer(train_step)
-
-            iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.
-            loss_meter.update(loss_val)
-            input_var = float(AllReduce.apply(clips.view(clips.shape[0], -1).var(dim=1).mean(dim=0)))
-            input_var_min = float(AllReduce.apply(torch.min(clips.view(clips.shape[0], -1).var(dim=1))))
-            input_var_meter.update(input_var)
-            input_var_min_meter.update(input_var_min)
-            jepa_loss_meter.update(loss_jepa_val)
-            reg_loss_meter.update(loss_reg_val)
-            gpu_time_meter.update(gpu_etime_ms)
-            wall_time_meter.update(iter_elapsed_time_ms)
-            action_loss_meter.update(loss_actions_reg)
-            
-
-            # ---------------------------------------------------------
-            # W&B logging for every iteration
-            # ---------------------------------------------------------
-            if rank == 0:
-                wandb_dict = {
-                    "epoch": epoch + 1,
-                    "iteration": itr,
-                    "global_step": global_step,
-                    "loss": loss_val,
-                    "loss_jepa": loss_jepa_val,
-                    "loss_reg": loss_reg_val,
-                    "loss_action": loss_actions_reg,
-                    # "enc_grad_norm": grad_stats_enc.global_norm,
-                    # "pred_grad_norm": grad_stats_pred.global_norm,
-                    "gpu_time_ms": gpu_etime_ms,
-                    # "wall_time_ms": iter_elapsed_time_ms,
-                    # "input_var": input_var,
-                    # "input_var_min": input_var_min,
-                    "lr": new_lr,
-                    # "weight_decay": new_wd,
-                }
-                # Optionally, log the first/last layer grads, etc.
-                wandb_dict.update({
-                    "enc_grad_first_layer": grad_stats_enc.first_layer,
-                    "enc_grad_last_layer": grad_stats_enc.last_layer,
-                    "pred_grad_first_layer": grad_stats_pred.first_layer,
-                    "pred_grad_last_layer": grad_stats_pred.last_layer,
-                })
-                # Log
-                wandb.log(wandb_dict, step=global_step)
-
-            # Print to stdout only if needed
-            if (itr % log_freq == 0) or np.isnan(loss_val) or np.isinf(loss_val):
-                print((
-                    f"[Epoch {epoch+1}, Iter {itr}/{ipe}] "
-                    f"loss: {loss_meter.avg:.3f} | jepa: {jepa_loss_meter.avg:.3f}, reg: {reg_loss_meter.avg:.3f} | "
-                    f"input_var: {input_var_meter.avg:.3f}, min: {input_var_min_meter.avg:.3f} | "
-                    f"[wd: {new_wd:.2e}, lr: {new_lr:.2e}] | "
-                    f"GPU mem: {torch.cuda.max_memory_allocated() / 1024.0**2:.2f}MB | "
-                    f"gpu_time: {gpu_time_meter.avg:.2f}ms, wall_time: {wall_time_meter.avg:.2f}ms"
-                ))
-
-            if np.isnan(loss_val):
-                print("[WARN] Loss is NaN! Stopping training.")
-                return
-
-        # -- End of epoch
-        print(f"[INFO] Epoch {epoch+1} finished. Avg loss = {loss_meter.avg:.3f}")
-
-        # Evaluation on rank=0
-        if rank == 0:
-            eval_loss_avg, eval_loss_jepa_avg, eval_loss_action_avg, eval_loss_reg_avg = evaluate(
-                encoder, predictor, action_model, token_learner, target_encoder,
-                eval_loader, device, clip_model, clip_tokenizer,
-                dtype, mixed_precision, mask_type, num_clips, loss_exp, reg_coeff, wandb,
-            )
-            print((
-                f"[Eval @ epoch {epoch+1}] eval_loss: {eval_loss_avg:.3f}, "
-                f"eval_jepa: {eval_loss_jepa_avg:.3f}, eval_reg: {eval_loss_reg_avg:.3f}"
-            ))
-            # Log evaluation metrics in wandb
-            wandb.log({
-                "eval/epoch": epoch + 1,
-                "eval/loss": eval_loss_avg,
-                "eval/loss_jepa": eval_loss_jepa_avg,
-                "eval/loss_reg": eval_loss_reg_avg,
-                "eval/loss_action": eval_loss_action_avg
-            }, step=global_step)
-
-        # Save checkpoint
-        if epoch % checkpoint_freq == 0 or epoch == (num_epochs - 1):
-            save_checkpoint(epoch + 1, latest_path)
-            if save_every_freq > 0 and epoch % save_every_freq == 0:
-                save_every_path = os.path.join(folder, f'{tag}-e{epoch}.pth.tar')
-                save_checkpoint(epoch + 1, save_every_path)
+    print("[INFO] Finished plotting Episode 1 and Episode 2.")

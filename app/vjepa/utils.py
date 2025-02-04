@@ -124,9 +124,10 @@ def load_checkpoint(
         encoder,
         predictor,
         target_encoder,
+        action_model,
         opt,
         scaler,
-        epoch,
+        epoch,   
     )
 
 

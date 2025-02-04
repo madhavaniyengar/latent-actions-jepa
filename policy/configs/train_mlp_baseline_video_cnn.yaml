@@ -4,11 +4,11 @@ tasks_per_node: 1
 data:
   dataset_type: VideoDataset
   datasets:
-    - /home/madhavan/jepa/data/droid_videos_2/video_labels_one.csv
+    - /home/madhavan/jepa/data/droid_videos_2/video_labels.csv
   eval_datasets:
-    - /home/madhavan/jepa/data/droid_videos_2/video_labels_one.csv
+    - /home/madhavan/jepa/data/droid_videos_2/video_labels_eval.csv
   decode_one_clip: true
-  batch_size: 1 # 24 -> 2
+  batch_size: 8 # 24 -> 2
   num_clips: 1
   num_frames: 16
   tubelet_size: 2
@@ -32,7 +32,7 @@ data_aug:
   reprob: 0.0
 logging:
   folder: /home/madhavan/jepa/logging/
-  write_tag: debug_diffusion_five_video
+  write_tag: tsne
 loss:
   loss_exp: 1.0
   reg_coeff: 0.0
@@ -64,14 +64,12 @@ mask:
 meta:
   load_checkpoint: true
   read_checkpoint: '/home/madhavan/jepa/ckpts/vitl16.pth'
-  diffusion_checkpoint_path: /home/madhavan/jepa/logging/diffusion_model_ckpt.pth.tar
   # laod_checkpoint: false
   # read_checkpoint: null
   seed: 234
   eval_freq: 100
   use_sdpa: true
   dtype: bfloat16
-  save_every_freq: 100
 model:
   model_name: vit_large
   pred_depth: 12
@@ -80,13 +78,15 @@ model:
   use_mask_tokens: true
   zero_init_mask_tokens: true
   action_dim: 1024
+  token_learning_model: 'avgpool'
+  policy_learning_model: 'standard_cnn'
 optimization:
   # ipe: 300
   ipe_scale: 1.25
   clip_grad: 10.0
   weight_decay: 0.04
   final_weight_decay: 0.4
-  epochs: 400
+  epochs: 100
   warmup: 40
   start_lr: 0.0002
   lr: 0.000625
